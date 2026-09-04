@@ -9,11 +9,11 @@
 <h1 align="center">👁 omo-fucking-watch-extension</h1>
 
 <p align="center">
-  <b>muse-spark 가 말없이 멈추면, 턴을 끊고 같은 일을 이어 간다.</b>
+  <b>muse-spark 가 죽으면 끊고, todo 남기고 도망치면 다시 민다.</b>
 </p>
 
 <p align="center">
-  <i>HTTP 에러가 안 나와도. 토큰이 끊겨도. todo 남기고 프롬프트로 돌아와도.</i>
+  <i>HTTP 에러가 없어도. 토큰이 끊겨도. ❯ 로 돌아와도.</i>
 </p>
 
 <p align="center">
@@ -39,12 +39,12 @@
 </p>
 
 ```
-              ·  ·  ·  SCAN  ·  ·  ·
+              ·  ·  ·  WATCH  ·  ·  ·
                      ╱╲
                     ╱  ╲
                    │ ◉  │     muse-spark
                     ╲  ╱      silent hang
-                     ╲╱
+                     ╲╱       leftover todos
               ────────●────────
                  abort · continue
 ```
@@ -57,14 +57,14 @@
   <img src="assets/divider.svg" width="560" alt="">
 </p>
 
-## 왜 레이더가 필요한가
+## 왜 워치가 필요한가
 
 `cliproxy/muse-spark-1.3-contributor-free` 는 싸다. 그리고 자주 멈춘다.
 
 HTTP 4xx/5xx 는 OmO 엔진 retry 가 잡는다.  
-문제는 **에러가 안 나오는 죽음**이다. 스트림이 끊기고, 툴도 없고, 루프만 살아 있다.
+문제는 **에러가 안 나오는 죽음**이다. 스트림이 끊기고, 툴도 없고, 루프만 살아 있다. 아니면 todo 열어 놓고 `❯` 로 돌아온다.
 
-그 구멍을 이 익스텐션이 본다.
+그 구멍을 이 익스텐션이 본다. 예전 이름은 `omo-free-muse-extension` 이었다. 지금은 **omo-fucking-watch-extension**.
 
 ## 설치
 
@@ -86,6 +86,8 @@ cp muse-watch.js ~/.omo/agent/extensions/
 
 파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. idle이어도 열린 todo를 폴링한다. `omo -r` 은 필요 없다. 토스트 `muse idle with N open todo(s)` 가 보이면 그 칸을 다시 돌린 것이다.
 
+예전 레포 URL `MovieHolic-Plex/omo-free-muse-extension` 은 GitHub가 여기로 리다이렉트한다.
+
 ## 무엇을 하나
 
 메인 세션에서 **지금 모델이 muse-spark** 일 때 두 가지를 잡는다.
@@ -95,6 +97,8 @@ cp muse-watch.js ~/.omo/agent/extensions/
 **2. 조기 정지** — 턴이 끝났거나 이미 `❯` idle 인데 `pending` / `in_progress` todo 가 남아 있으면 follow-up 으로 같은 일을 계속한다. idle 은 약 8초 뒤에 폴링한다.
 
 둘 다 토스트가 뜬다. hang 은 세션당 4번, 조기 정지는 6번까지.
+
+Senpi 는 `ctx.model` 이다. omp 의 `ctx.models.current()` / `ctx.setTimeout` 만 보고 짜면 `/reload` 해도 안 돈다. 이 워치는 둘 다 받는다.
 
 ## 무엇을 안 하나
 
@@ -118,10 +122,11 @@ hang (every 5s)
 
 조기 정지
   ├─ agent_end: muse + 열린 todo
+  ├─ session_start /reload: muse + 열린 todo
   └─ idle poll: muse + ❯ + 열린 todo (8s 유예)
 ```
 
-Senpi 는 `ctx.model` 이고 `ctx.setTimeout` 이 없다. omp 는 `ctx.models.current()` 와 contained timer 가 있다. 워치독은 둘 다 받는다. Senpi 에서는 raw timer 를 try/catch 하고 `/reload` 의 `session_shutdown` 에서 지운다. 안 그러면 stale ctx 가 세션을 죽인다.
+Senpi 는 `ctx.model` 이고 `ctx.setTimeout` 이 없다. omp 는 `ctx.models.current()` 와 contained timer 가 있다. Senpi 에서는 raw timer 를 try/catch 하고 `/reload` 의 `session_shutdown` 에서 지운다. 안 그러면 stale ctx 가 세션을 죽인다. idle 에서는 `deliverAs: followUp` 없이 바로 send 한다.
 
 ## 엔진이랑 같이
 
@@ -166,7 +171,7 @@ Senpi 는 `ctx.model` 이고 `ctx.setTimeout` 이 없다. omp 는 `ctx.models.cu
 ```
 Muse 턴
   ├─ 에러 / 25s 첫토큰 / 45s 전체     → retry → grok-4.6
-  └─ 에러 없이 40s 무음                 → muse-watch abort → continue
+  └─ 에러 없이 40s 무음                 → fucking-watch abort → continue
 ```
 
 ## 설정
@@ -177,7 +182,7 @@ Muse 턴
 | `OMO_MUSE_STALL_MS` | `40000` | 무음 판정. 최소 1000 |
 | `OMO_MUSE_IDLE_TODO_MS` | `8000` | idle 에서 todo continue 하기 전 유예 |
 
-의존성 없음. 파일 하나.
+의존성 없음. 파일 하나. `muse-watch.js`.
 
 ## 라이선스
 

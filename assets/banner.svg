@@ -35,8 +35,9 @@
     <circle cx="70" cy="96" r="4" fill="#34d399"/>
   </g>
   <g fill="#f3effc" font-family="Georgia, serif">
-    <text x="560" y="175" font-size="22" letter-spacing="8" fill="#22d3ee">OMO · SENPI</text>
-    <text x="560" y="240" font-size="54" font-weight="700">free muse</text>
-    <text x="560" y="292" font-size="22" fill="#c4b5fd">stall watchdog for muse-spark-1.3</text>
+    <text x="540" y="168" font-size="20" letter-spacing="8" fill="#22d3ee">OMO · SENPI</text>
+    <text x="540" y="232" font-size="44" font-weight="700">fucking watch</text>
+    <text x="540" y="278" font-size="20" fill="#c4b5fd">omo-fucking-watch-extension</text>
+    <text x="540" y="314" font-size="18" fill="#a78bfa">stall watchdog for muse-spark-1.3</text>
   </g>
 </svg>
