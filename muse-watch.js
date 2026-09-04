@@ -11,8 +11,10 @@
  * Tune:    OMO_MUSE_STALL_MS (default 40000)
  *          OMO_MUSE_IDLE_TODO_MS (default 8000) — idle grace before todo kick
  *
- * Use ctx.setInterval / ctx.setTimeout only. A raw timer throw tears down
- * the whole session.
+ * Senpi ExtensionContext has `ctx.model` and no ctx.setTimeout/setInterval.
+ * omp has ctx.models.current() plus contained timers. Use whichever exists.
+ * Raw timers must catch throws and be cleared on session_shutdown, or a stale
+ * ctx after /reload becomes an uncaughtException that kills the session.
  */
 
 const MUSE_RE = /muse-spark/i;
@@ -24,6 +26,7 @@ const TICK_MS = 5_000;
 const COOLDOWN_MS = 60_000;
 const MAX_STALL_TRIPS = 4;
 const MAX_PREMATURE_TRIPS = 6;
+const STALE_CTX_PREFIX = "This extension ctx is stale after session replacement or reload.";
 const STALL_PROMPT =
   "Previous model stalled with no stream activity. Continue the same task from where it stopped. Do not restart from scratch.";
 
@@ -43,9 +46,12 @@ function enabled() {
 
 function modelBlob(ctx) {
   try {
-    const model = ctx.models?.current?.();
+    const model = ctx?.model ?? ctx?.models?.current?.();
     if (!model) return "";
-    return [model.id, model.provider, model.name, model.api].filter(Boolean).join(" ");
+    if (typeof model === "string") return model;
+    return [model.id, model.provider, model.name, model.api, model.displayName]
+      .filter(Boolean)
+      .join(" ");
   } catch {
     return "";
   }
@@ -55,11 +61,58 @@ function isMuse(ctx) {
   return MUSE_RE.test(modelBlob(ctx));
 }
 
+function isStaleCtxError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.startsWith(STALE_CTX_PREFIX);
+}
+
 function notify(ctx, message, kind = "warning") {
   try {
     if (ctx.hasUI) ctx.ui.notify(message, kind);
   } catch {
-    // rpc / headless
+    // rpc / headless / stale
+  }
+}
+
+function scheduleTimeout(ctx, fn, ms) {
+  const run = () => {
+    try {
+      fn();
+    } catch (error) {
+      if (isStaleCtxError(error)) return;
+    }
+  };
+  if (ctx && typeof ctx.setTimeout === "function") {
+    return { kind: "ctx", id: ctx.setTimeout(run, ms), ctx };
+  }
+  return { kind: "raw", id: setTimeout(run, ms) };
+}
+
+function scheduleInterval(ctx, fn, ms) {
+  const run = () => {
+    try {
+      fn();
+    } catch (error) {
+      if (isStaleCtxError(error)) return;
+    }
+  };
+  if (ctx && typeof ctx.setInterval === "function") {
+    return { kind: "ctx", id: ctx.setInterval(run, ms), ctx };
+  }
+  return { kind: "raw", id: setInterval(run, ms) };
+}
+
+function clearScheduled(timer) {
+  if (!timer) return;
+  try {
+    if (timer.kind === "ctx") {
+      timer.ctx.clearTimer?.(timer.id);
+    } else {
+      clearTimeout(timer.id);
+      clearInterval(timer.id);
+    }
+  } catch {
+    // already gone
   }
 }
 
@@ -124,21 +177,55 @@ export default function (pi) {
   let prematureTrips = 0;
   let pending = false;
   let lastTodoSig = "";
+  let lastSkip = "";
+  let liveCtx;
   let stallTimer;
+  let kickTimer;
 
-  const bump = () => {
+  const bump = (_event, ctx) => {
     lastActivity = Date.now();
+    if (ctx) liveCtx = ctx;
   };
 
+  function stopTimers() {
+    clearScheduled(stallTimer);
+    clearScheduled(kickTimer);
+    stallTimer = undefined;
+    kickTimer = undefined;
+  }
+
   function kickPremature(ctx, label) {
-    if (pending) return false;
-    if (!isMuse(ctx)) return false;
-    if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) return false;
-    if (prematureTrips >= MAX_PREMATURE_TRIPS) return false;
-    if (Date.now() - lastPrematureTrip < COOLDOWN_MS && prematureTrips > 0) return false;
+    lastSkip = "";
+    if (!ctx) {
+      lastSkip = "no-ctx";
+      return false;
+    }
+    if (pending) {
+      lastSkip = "pending";
+      return false;
+    }
+    if (!isMuse(ctx)) {
+      lastSkip = `not-muse:${modelBlob(ctx) || "none"}`;
+      return false;
+    }
+    if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) {
+      lastSkip = "queued";
+      return false;
+    }
+    if (prematureTrips >= MAX_PREMATURE_TRIPS) {
+      lastSkip = "max-trips";
+      return false;
+    }
+    if (Date.now() - lastPrematureTrip < COOLDOWN_MS && prematureTrips > 0) {
+      lastSkip = "cooldown";
+      return false;
+    }
 
     const open = latestOpenTodos(ctx);
-    if (open.length === 0) return false;
+    if (open.length === 0) {
+      lastSkip = "no-open-todos";
+      return false;
+    }
 
     lastTodoSig = open.join("\n");
     lastPrematureTrip = Date.now();
@@ -150,24 +237,28 @@ export default function (pi) {
       "warning",
     );
 
-    ctx.setTimeout(() => {
-      try {
-        pi.sendUserMessage(prematurePrompt(open), {
-          deliverAs: "followUp",
-          triggerTurn: true,
-        });
-      } catch {
-        // follow-up is best effort
-      } finally {
-        bump();
-        pending = false;
-      }
-    }, 400);
+    kickTimer = scheduleTimeout(
+      ctx,
+      () => {
+        try {
+          pi.sendUserMessage(prematurePrompt(open), {
+            deliverAs: "followUp",
+            triggerTurn: true,
+          });
+        } catch {
+          // follow-up is best effort
+        } finally {
+          lastActivity = Date.now();
+          pending = false;
+        }
+      },
+      400,
+    );
     return true;
   }
 
   function tick(ctx) {
-    if (pending) return;
+    if (!ctx || pending) return;
     if (!isMuse(ctx)) return;
 
     const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
@@ -193,35 +284,40 @@ export default function (pi) {
 
     try {
       ctx.abort?.();
-    } catch {
+    } catch (error) {
       pending = false;
+      if (isStaleCtxError(error)) stopTimers();
       return;
     }
 
-    ctx.setTimeout(() => {
-      try {
-        pi.sendUserMessage(STALL_PROMPT, {
-          deliverAs: "followUp",
-          triggerTurn: true,
-        });
-      } catch {
-        // follow-up is best effort
-      } finally {
-        bump();
-        pending = false;
-      }
-    }, 1200);
+    kickTimer = scheduleTimeout(
+      ctx,
+      () => {
+        try {
+          pi.sendUserMessage(STALL_PROMPT, {
+            deliverAs: "followUp",
+            triggerTurn: true,
+          });
+        } catch {
+          // follow-up is best effort
+        } finally {
+          lastActivity = Date.now();
+          pending = false;
+        }
+      },
+      1200,
+    );
   }
 
   function ensureTicker(ctx) {
-    if (stallTimer || typeof ctx.setInterval !== "function") return;
-    stallTimer = ctx.setInterval(() => tick(ctx), TICK_MS);
+    if (!ctx || stallTimer) return;
+    stallTimer = scheduleInterval(ctx, () => tick(liveCtx || ctx), TICK_MS);
   }
 
   pi.on("message_update", bump);
   pi.on("message_start", bump);
-  pi.on("after_provider_response", () => {
-    bump();
+  pi.on("after_provider_response", (_event, ctx) => {
+    bump(_event, ctx);
     stallTrips = 0;
   });
   pi.on("auto_retry_start", bump);
@@ -232,7 +328,14 @@ export default function (pi) {
   pi.on("agent_start", bump);
   pi.on("turn_start", bump);
 
+  pi.on("session_shutdown", () => {
+    stopTimers();
+    liveCtx = undefined;
+    pending = false;
+  });
+
   pi.on("session_start", (_event, ctx) => {
+    liveCtx = ctx;
     lastActivity = Date.now();
     lastStallTrip = 0;
     lastPrematureTrip = 0;
@@ -240,17 +343,29 @@ export default function (pi) {
     prematureTrips = 0;
     pending = false;
     lastTodoSig = "";
-    if (stallTimer && typeof ctx.clearTimer === "function") {
-      ctx.clearTimer(stallTimer);
-      stallTimer = undefined;
-    }
+    lastSkip = "";
+    stopTimers();
     ensureTicker(ctx);
-    ctx.setTimeout(() => {
-      kickPremature(ctx, "resume");
-    }, 800);
+    scheduleTimeout(
+      ctx,
+      () => {
+        const target = liveCtx || ctx;
+        const kicked = kickPremature(target, "resume");
+        if (kicked) return;
+        const open = latestOpenTodos(target);
+        if (open.length === 0) return;
+        notify(
+          target,
+          `muse-watch resume skipped (${lastSkip}) with ${open.length} open todo(s)`,
+          "warning",
+        );
+      },
+      800,
+    );
   });
 
   pi.on("agent_end", (event, ctx) => {
+    liveCtx = ctx;
     ensureTicker(ctx);
     if (event?.willRetry === true) return;
     if (event?.aborted === true && event.abortSource === "user") return;

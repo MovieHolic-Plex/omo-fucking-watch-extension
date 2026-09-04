@@ -84,7 +84,7 @@ copy muse-watch.js %USERPROFILE%\.omo\agent\extensions\
 cp muse-watch.js ~/.omo/agent/extensions/
 ```
 
-익스텐션 파일이 로드된 세션은 **idle이어도** 열린 todo를 폴링한다. `omo -r` 은 필요 없다. 토스트 `muse idle with N open todo(s)` 가 보이면 그 칸을 다시 돌린 것이다.
+파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. idle이어도 열린 todo를 폴링한다. `omo -r` 은 필요 없다. 토스트 `muse idle with N open todo(s)` 가 보이면 그 칸을 다시 돌린 것이다.
 
 ## 무엇을 하나
 
@@ -121,7 +121,7 @@ hang (every 5s)
   └─ idle poll: muse + ❯ + 열린 todo (8s 유예)
 ```
 
-타이머는 반드시 `ctx.setInterval` / `ctx.setTimeout` 이다. 일반 `setInterval` 이 던지면 **세션 전체가 죽는다.**
+Senpi 는 `ctx.model` 이고 `ctx.setTimeout` 이 없다. omp 는 `ctx.models.current()` 와 contained timer 가 있다. 워치독은 둘 다 받는다. Senpi 에서는 raw timer 를 try/catch 하고 `/reload` 의 `session_shutdown` 에서 지운다. 안 그러면 stale ctx 가 세션을 죽인다.
 
 ## 엔진이랑 같이
 
