@@ -47,18 +47,35 @@ function enabled() {
 function modelBlob(ctx) {
   try {
     const model = ctx?.model ?? ctx?.models?.current?.();
-    if (!model) return "";
-    if (typeof model === "string") return model;
-    return [model.id, model.provider, model.name, model.api, model.displayName]
-      .filter(Boolean)
-      .join(" ");
+    if (model) {
+      if (typeof model === "string") return model;
+      const blob = [model.id, model.provider, model.name, model.api, model.displayName]
+        .filter(Boolean)
+        .join(" ");
+      if (blob) return blob;
+    }
   } catch {
-    return "";
+    // fall through to session history
   }
+  try {
+    const entries =
+      ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i];
+      if (entry?.type !== "model_change") continue;
+      return [entry.modelId, entry.provider, entry.model].filter(Boolean).join(" ");
+    }
+  } catch {
+    // ignore
+  }
+  return "";
 }
 
 function isMuse(ctx) {
-  return MUSE_RE.test(modelBlob(ctx));
+  const blob = modelBlob(ctx);
+  if (blob) return MUSE_RE.test(blob);
+  // Unknown model + open todos is the wish-5 /reload case: do not skip.
+  return true;
 }
 
 function isStaleCtxError(error) {
@@ -71,6 +88,14 @@ function notify(ctx, message, kind = "warning") {
     if (ctx.hasUI) ctx.ui.notify(message, kind);
   } catch {
     // rpc / headless / stale
+  }
+}
+
+function setWatchStatus(ctx, text) {
+  try {
+    ctx.ui?.setStatus?.("muse-watch", text);
+  } catch {
+    // no footer
   }
 }
 
@@ -231,29 +256,35 @@ export default function (pi) {
     lastPrematureTrip = Date.now();
     prematureTrips += 1;
     pending = true;
-    notify(
-      ctx,
-      `muse ${label} with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`,
-      "warning",
-    );
+    const toast = `muse ${label} with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`;
+    notify(ctx, toast, "warning");
+    setWatchStatus(ctx, toast);
 
-    kickTimer = scheduleTimeout(
-      ctx,
-      () => {
-        try {
-          pi.sendUserMessage(prematurePrompt(open), {
-            deliverAs: "followUp",
-            triggerTurn: true,
+    const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
+    const send = () => {
+      try {
+        const result = idle
+          ? pi.sendUserMessage(prematurePrompt(open))
+          : pi.sendUserMessage(prematurePrompt(open), { deliverAs: "followUp" });
+        if (result && typeof result.then === "function") {
+          result.catch((error) => {
+            lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
+            notify(ctx, `muse-watch send failed: ${lastSkip}`, "error");
+            setWatchStatus(ctx, `send-fail ${lastSkip}`);
+            pending = false;
           });
-        } catch {
-          // follow-up is best effort
-        } finally {
-          lastActivity = Date.now();
-          pending = false;
         }
-      },
-      400,
-    );
+      } catch (error) {
+        lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
+        notify(ctx, `muse-watch send failed: ${lastSkip}`, "error");
+        setWatchStatus(ctx, `send-fail ${lastSkip}`);
+        pending = false;
+        return;
+      }
+      lastActivity = Date.now();
+      pending = false;
+    };
+    kickTimer = scheduleTimeout(ctx, send, idle ? 0 : 400);
     return true;
   }
 
@@ -294,16 +325,18 @@ export default function (pi) {
       ctx,
       () => {
         try {
-          pi.sendUserMessage(STALL_PROMPT, {
-            deliverAs: "followUp",
-            triggerTurn: true,
-          });
+          const result = pi.sendUserMessage(STALL_PROMPT, { deliverAs: "followUp" });
+          if (result && typeof result.then === "function") {
+            result.catch(() => {
+              pending = false;
+            });
+          }
         } catch {
-          // follow-up is best effort
-        } finally {
-          lastActivity = Date.now();
           pending = false;
+          return;
         }
+        lastActivity = Date.now();
+        pending = false;
       },
       1200,
     );
@@ -345,23 +378,27 @@ export default function (pi) {
     lastTodoSig = "";
     lastSkip = "";
     stopTimers();
+    const openAtStart = latestOpenTodos(ctx);
+    const blob = modelBlob(ctx) || "no-model";
+    setWatchStatus(ctx, `armed ${blob} todos=${openAtStart.length}`);
     ensureTicker(ctx);
-    scheduleTimeout(
-      ctx,
-      () => {
-        const target = liveCtx || ctx;
-        const kicked = kickPremature(target, "resume");
-        if (kicked) return;
-        const open = latestOpenTodos(target);
-        if (open.length === 0) return;
-        notify(
-          target,
-          `muse-watch resume skipped (${lastSkip}) with ${open.length} open todo(s)`,
-          "warning",
-        );
-      },
-      800,
-    );
+    const kicked = kickPremature(ctx, "resume");
+    if (kicked) return;
+    if (openAtStart.length === 0) return;
+    const skipText = `resume skipped (${lastSkip}) todos=${openAtStart.length}`;
+    setWatchStatus(ctx, skipText);
+    notify(ctx, `muse-watch ${skipText}`, "warning");
+  });
+
+  pi.registerCommand?.("muse-watch", {
+    description: "Show muse-watch model/todo status",
+    handler: (_args, ctx) => {
+      liveCtx = ctx;
+      const open = latestOpenTodos(ctx);
+      const text = `model=${modelBlob(ctx) || "none"} muse=${isMuse(ctx)} idle=${ctx.isIdle?.()} todos=${open.length} skip=${lastSkip || "-"} trips=${prematureTrips}`;
+      setWatchStatus(ctx, text);
+      notify(ctx, text, "info");
+    },
   });
 
   pi.on("agent_end", (event, ctx) => {
