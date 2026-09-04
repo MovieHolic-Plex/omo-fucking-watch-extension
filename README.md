@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <i>HTTP 에러가 안 나와도. 토큰이 끊겨도. 메인 칸은 죽지 않는다.</i>
+  <i>HTTP 에러가 안 나와도. 토큰이 끊겨도. todo 남기고 프롬프트로 돌아와도.</i>
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@
 ```
 
 <p align="center">
-  <code>40s</code> 무음 &nbsp;→&nbsp; <code>abort</code> &nbsp;→&nbsp; follow-up &nbsp;→&nbsp; Grok 체인이 받을 수 있게
+  <code>40s</code> 무음 → abort · 열린 todo 남기고 턴 종료 → continue
 </p>
 
 <p align="center">
@@ -88,15 +88,14 @@ cp muse-watch.js ~/.omo/agent/extensions/
 
 ## 무엇을 하나
 
-메인 세션에서 **지금 모델이 muse-spark** 이고, 에이전트가 idle 이 아닌데, 스트림·툴·retry 이벤트가 **40초** 동안 없으면:
+메인 세션에서 **지금 모델이 muse-spark** 일 때 두 가지를 잡는다.
 
-1. 토스트를 띄운다
-2. 그 턴을 `abort` 한다
-3. 1.2초 뒤 같은 세션에 follow-up 을 넣는다  
-   *Previous model stalled… Continue the same task…*
-4. 엔진 fallback 이 다음 턴을 잡으면 Grok 으로 이어질 수 있다
+**1. Silent hang** — 루프가 아직 도는데 스트림·툴이 40초 동안 없으면 abort 하고 이어서 돌린다.
 
-정상 응답이 한 번 끝나면 trip 카운트는 0으로 돌아간다.
+**2. 조기 정지** — 턴이 정상 종료됐는데 `pending` / `in_progress` todo 가 남아 있으면 follow-up 으로 같은 일을 계속한다.  
+예: *「순서대로 뜯겠습니다」* 하고 `❯` 로 돌아온 omo-3.
+
+둘 다 토스트가 뜬다. hang 은 세션당 4번, 조기 정지는 6번까지.
 
 ## 무엇을 안 하나
 
@@ -104,7 +103,8 @@ cp muse-watch.js ~/.omo/agent/extensions/
 
 | 상황 | 담당 |
 | --- | --- |
-| 메인 칸 Muse 가 말없이 멈춤 | **이 익스텐션** |
+| 메인 칸 Muse 가 말없이 멈춤 | **이 익스텐션** (hang) |
+| 메인 칸 Muse 가 todo 남기고 프롬프트로 복귀 | **이 익스텐션** (조기 정지) |
 | HTTP 에러 / 첫 토큰 타임아웃 | `settings.json` `retry.fallbackChains` |
 | `task` 로 띄운 백그라운드 Muse 워커 | `is_unstable_agent` + babysitter + category `models[]` |
 | omo 프로세스 자체 사망 | 훅도 같이 죽음. Herdr 바깥 감시 |
@@ -114,11 +114,12 @@ cp muse-watch.js ~/.omo/agent/extensions/
 ## 한 바퀴
 
 ```
-every 5s
-  ├─ model ~= muse-spark ?
-  ├─ parent not idle ?
-  ├─ no stream / tool / retry for 40s ?
-  └─ yes → abort → continue  (max 4 / session, 60s cooldown)
+hang (every 5s)
+  ├─ muse + not idle + 40s silent → abort → continue
+
+조기 정지 (agent_end)
+  ├─ muse + 열린 todo + 사용자 abort 아님
+  └─ follow-up: 남은 todo 목록과 함께 계속
 ```
 
 타이머는 반드시 `ctx.setInterval` / `ctx.setTimeout` 이다. 일반 `setInterval` 이 던지면 **세션 전체가 죽는다.**
