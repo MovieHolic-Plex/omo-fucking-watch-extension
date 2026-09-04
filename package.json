@@ -1,16 +1,16 @@
 {
-  "name": "omo-free-muse-extension",
-  "version": "0.1.6",
+  "name": "omo-fucking-watch-extension",
+  "version": "0.1.7",
   "description": "Senpi/OmO extension: abort silent muse-spark hangs on the main session and continue the same turn.",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://github.com/MovieHolic-Plex/omo-free-muse-extension",
+  "homepage": "https://github.com/MovieHolic-Plex/omo-fucking-watch-extension",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MovieHolic-Plex/omo-free-muse-extension.git"
+    "url": "git+https://github.com/MovieHolic-Plex/omo-fucking-watch-extension.git"
   },
   "bugs": {
-    "url": "https://github.com/MovieHolic-Plex/omo-free-muse-extension/issues"
+    "url": "https://github.com/MovieHolic-Plex/omo-fucking-watch-extension/issues"
   },
   "keywords": [
     "omo",

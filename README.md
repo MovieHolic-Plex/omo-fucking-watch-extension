@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="assets/banner.svg" width="920" alt="omo-free-muse-extension — stall watchdog for muse-spark">
+  <img src="assets/banner.svg" width="920" alt="omo-fucking-watch-extension — stall watchdog for muse-spark">
 </p>
 
 <p align="center">
   <img src="assets/divider.svg" width="560" alt="">
 </p>
 
-<h1 align="center">👁 omo-free-muse-extension</h1>
+<h1 align="center">👁 omo-fucking-watch-extension</h1>
 
 <p align="center">
   <b>muse-spark 가 말없이 멈추면, 턴을 끊고 같은 일을 이어 간다.</b>
@@ -19,13 +19,13 @@
 <p align="center">
   <a href="https://github.com/code-yeongyu/oh-my-openagent"><img src="https://img.shields.io/badge/OmO-Senpi-7C3AED?style=for-the-badge" alt="OmO Senpi"></a>
   <a href="https://dev.meta.ai/docs/coding-agents/"><img src="https://img.shields.io/badge/muse--spark-1.3-f5c15a?style=for-the-badge" alt="muse-spark 1.3"></a>
-  <a href="https://github.com/MovieHolic-Plex/omo-free-muse-extension/actions/workflows/check.yml"><img src="https://img.shields.io/github/actions/workflow/status/MovieHolic-Plex/omo-free-muse-extension/check.yml?style=for-the-badge&label=check" alt="check"></a>
+  <a href="https://github.com/MovieHolic-Plex/omo-fucking-watch-extension/actions/workflows/check.yml"><img src="https://img.shields.io/github/actions/workflow/status/MovieHolic-Plex/omo-fucking-watch-extension/check.yml?style=for-the-badge&label=check" alt="check"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3DDC84?style=for-the-badge" alt="MIT"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/MovieHolic-Plex/omo-free-muse-extension/stargazers"><img src="https://img.shields.io/github/stars/MovieHolic-Plex/omo-free-muse-extension?style=for-the-badge&color=d4a24a" alt="stars"></a>
-  <a href="https://github.com/MovieHolic-Plex/omo-free-muse-extension/commits/main"><img src="https://img.shields.io/github/last-commit/MovieHolic-Plex/omo-free-muse-extension?style=for-the-badge&color=7c3aed" alt="last commit"></a>
+  <a href="https://github.com/MovieHolic-Plex/omo-fucking-watch-extension/stargazers"><img src="https://img.shields.io/github/stars/MovieHolic-Plex/omo-fucking-watch-extension?style=for-the-badge&color=d4a24a" alt="stars"></a>
+  <a href="https://github.com/MovieHolic-Plex/omo-fucking-watch-extension/commits/main"><img src="https://img.shields.io/github/last-commit/MovieHolic-Plex/omo-fucking-watch-extension?style=for-the-badge&color=7c3aed" alt="last commit"></a>
   <img src="https://img.shields.io/badge/Windows%20·%20macOS%20·%20Linux-111827?style=for-the-badge" alt="platforms">
 </p>
 
@@ -71,7 +71,7 @@ HTTP 4xx/5xx 는 OmO 엔진 retry 가 잡는다.
 OmO Senpi (`omo` CLI) 가 필요하다.
 
 ```bash
-omo install https://github.com/MovieHolic-Plex/omo-free-muse-extension --no-approve
+omo install https://github.com/MovieHolic-Plex/omo-fucking-watch-extension --no-approve
 ```
 
 또는 파일을 직접 둔다.
