@@ -50,6 +50,19 @@ CONTINUE = (
     "Continue the same task now. Do not wait for the user. Do not restart from scratch.\n"
     "Open todos:\n"
 )
+CONTRACT_CONTINUE = (
+    "You ended the turn before your declared stop-when contract held. That is a premature stop. "
+    "Continue the same task now. Do not wait for the user. Do not restart from scratch.\n"
+    "Unmet contract:\n"
+)
+STOP_WHEN_RE = re.compile(r"I(?:['’]ll| will) stop when\s+(.+?)(?:\.|$)", re.I)
+PR_URL_RE = re.compile(r"github\.com/[^\s)\]>'\"]+/pull/\d+", re.I)
+NEEDS_PR_RE = re.compile(r"\bpr\b|pull request|pr url", re.I)
+USER_WAIT_RE = re.compile(
+    r"\b(you confirm|your answer|the user|user replies|you say|wait for (?:the )?user)\b",
+    re.I,
+)
+SESSIONS_DIR = Path.home() / ".omo" / "agent" / "sessions"
 
 
 def enabled() -> bool:
@@ -117,6 +130,72 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_PATH)
 
 
+def session_jsonl_for_cwd(cwd: str) -> Path | None:
+    if not SESSIONS_DIR.is_dir() or not cwd:
+        return None
+    needle = cwd.replace("\\", "-").replace("/", "-").replace(":", "")
+    hits: list[tuple[float, Path]] = []
+    for folder in SESSIONS_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        if needle not in folder.name and Path(cwd).name not in folder.name:
+            continue
+        for jsonl in folder.glob("*.jsonl"):
+            try:
+                hits.append((jsonl.stat().st_mtime, jsonl))
+            except OSError:
+                continue
+    if not hits:
+        return None
+    hits.sort(reverse=True)
+    return hits[0][1]
+
+
+def unfinished_from_jsonl(cwd: str) -> tuple[str, list[str]]:
+    path = session_jsonl_for_cwd(cwd)
+    if path is None:
+        return ("", [])
+    when = ""
+    has_pull = False
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                blob = json.dumps(entry, ensure_ascii=False)
+                if PR_URL_RE.search(blob):
+                    has_pull = True
+                if entry.get("customType") == "muse-watch.contract" and isinstance(entry.get("data"), dict):
+                    when = str(entry["data"].get("when") or "")
+                    continue
+                message = entry.get("message") if entry.get("type") == "message" else entry
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                text = content if isinstance(content, str) else ""
+                if isinstance(content, list):
+                    text = "\n".join(
+                        str(block.get("text") or "")
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                match = STOP_WHEN_RE.search(text)
+                if match:
+                    when = match.group(1).strip()
+    except OSError:
+        return ("", [])
+    if not when or USER_WAIT_RE.search(when):
+        return ("", [])
+    if NEEDS_PR_RE.search(when) and not has_pull:
+        return ("contract", [f"I'll stop when {when}"])
+    return ("", [])
+
+
 def parse_open_todos(text: str) -> list[str]:
     lines = text.replace("\r\n", "\n").split("\n")
     last_head = -1
@@ -174,11 +253,11 @@ def should_skip_prompt(text: str) -> bool:
     return "❯" not in tail
 
 
-def kick(pane_id: str, open_todos: list[str]) -> None:
-    listed = "\n".join(f"- {item}" for item in open_todos[:8])
-    extra = f"\n- …and {len(open_todos) - 8} more" if len(open_todos) > 8 else ""
-    message = CONTINUE + listed + extra
-    herdr("pane", "send-text", pane_id, message)
+def kick(pane_id: str, open_items: list[str], kind: str) -> None:
+    listed = "\n".join(f"- {item}" for item in open_items[:8])
+    extra = f"\n- …and {len(open_items) - 8} more" if len(open_items) > 8 else ""
+    prefix = CONTRACT_CONTINUE if kind == "contract" else CONTINUE
+    herdr("pane", "send-text", pane_id, prefix + listed + extra)
     herdr("pane", "send-keys", pane_id, "Enter")
 
 
@@ -197,20 +276,24 @@ def tick(state: dict) -> dict:
         if should_skip_prompt(text):
             continue
         open_todos = parse_open_todos(text)
-        if not open_todos:
+        kind = "todos"
+        items = open_todos
+        if not items:
+            kind, items = unfinished_from_jsonl(str(agent.get("cwd") or ""))
+        if not items:
             continue
-        sig = "\n".join(open_todos)
+        sig = kind + "\n" + "\n".join(items)
         entry = state.get(pane_id) or {}
         if entry.get("sig") != sig:
             entry = {"sig": sig, "kicks": 0, "last": 0}
         if entry["kicks"] >= MAX_KICKS:
-            log(f"max {pane_id} {label} todos={len(open_todos)}")
+            log(f"max {pane_id} {label} {kind}={len(items)}")
             state[pane_id] = entry
             continue
         if now - int(entry.get("last") or 0) < COOLDOWN_MS:
             continue
         try:
-            kick(pane_id, open_todos)
+            kick(pane_id, items, kind)
         except RuntimeError as error:
             log(f"fail {pane_id} {error}")
             continue
@@ -218,7 +301,7 @@ def tick(state: dict) -> dict:
         entry["last"] = now
         entry["sig"] = sig
         state[pane_id] = entry
-        log(f"kick {pane_id} {label} #{entry['kicks']} todos={len(open_todos)} {open_todos[0][:80]}")
+        log(f"kick {pane_id} {label} #{entry['kicks']} {kind}={len(items)} {items[0][:80]}")
     return state
 
 
@@ -277,10 +360,11 @@ def main() -> int:
                 log(f"dry {pane_id} read: {error}")
                 continue
             open_todos = parse_open_todos(text)
+            kind, contract_items = unfinished_from_jsonl(str(agent.get("cwd") or ""))
             muse = bool(MUSE_RE.search(text))
             skip = should_skip_prompt(text)
             log(
-                f"dry {pane_id} status={agent.get('agent_status')} muse={muse} skip={skip} todos={len(open_todos)} {open_todos[:3]}"
+                f"dry {pane_id} status={agent.get('agent_status')} muse={muse} skip={skip} todos={len(open_todos)} contract={contract_items[:1]} {open_todos[:3]}"
             )
         return 0
     if once:

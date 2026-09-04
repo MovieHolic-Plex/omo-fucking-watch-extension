@@ -106,7 +106,12 @@ idle + muse + 열린 todo 면 continue 를 넣는다. `omo -r` 은 필요 없다
 
 **1. Silent hang** — 루프가 아직 도는데 스트림·툴이 40초 동안 없으면 abort 하고 이어서 돌린다.
 
-**2. 조기 정지** — 턴이 끝났거나 이미 `❯` idle 인데 `pending` / `in_progress` todo 가 남아 있으면 follow-up 으로 같은 일을 계속한다. idle 은 약 8초 뒤에 폴링한다.
+**2. 조기 정지** — 턴이 끝났거나 이미 `❯` idle 인데 아래 **세션 state** 가 남아 있으면 follow-up 으로 같은 일을 계속한다.
+
+- `senpi.todo-state` 의 `pending` / `in_progress`
+- `muse-watch.contract` — 모델이 연 턴마다 쓰는 `I'll stop when …` 를 custom entry 로 고정. PR URL 이 조건인데 transcript 에 pull 링크가 없으면 unmet.
+
+wish-ai-3 처럼 todo 를 안 남기고 끊긴 칸은, 말 꼬리를 추측하지 않는다. 선언한 stop-when 을 state 로 저장한 뒤 그게 안 채워졌는지만 본다.
 
 둘 다 토스트가 뜬다. hang 은 세션당 4번, 조기 정지는 6번까지.
 
@@ -120,6 +125,7 @@ Senpi 는 `ctx.model` 이다. omp 의 `ctx.models.current()` / `ctx.setTimeout` 
 | --- | --- |
 | 메인 칸 Muse 가 말없이 멈춤 | **이 익스텐션** (hang) |
 | 메인 칸 Muse 가 todo 남기고 프롬프트로 복귀 | **이 익스텐션** + **idle-todo-kick.py** |
+| todo 없이 `I'll stop when` 이 안 채워짐 | **이 익스텐션** (`muse-watch.contract`) |
 | HTTP 에러 / 첫 토큰 타임아웃 | `settings.json` `retry.fallbackChains` |
 | `task` 로 띄운 백그라운드 Muse 워커 | `is_unstable_agent` + babysitter + category `models[]` |
 | 이미 `❯` idle 인데 todo 가 남음 | **idle-todo-kick.py** (Herdr 바깥) |

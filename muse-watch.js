@@ -4,8 +4,9 @@
  * 1. Silent hang: live model is muse-spark, the parent loop is not idle, and
  *    no stream/tool activity arrives for STALL_MS → abort + continue.
  * 2. Premature stop: muse ends a turn, or sits idle, while pending/in_progress
- *    todos remain → follow-up so the same work keeps going. Idle sessions are
- *    polled; omo -r is not required.
+ *    todos remain, OR a declared "I'll stop when …" contract is still unmet
+ *    (no todo-state, like wish-ai-3). The contract is persisted as
+ *    muse-watch.contract so later ticks read state, not vibes.
  *
  * Disable: OMO_MUSE_WATCH=0
  * Tune:    OMO_MUSE_STALL_MS (default 40000)
@@ -19,7 +20,13 @@
 
 const MUSE_RE = /muse-spark/i;
 const TODO_STATE_TYPE = "senpi.todo-state";
+const CONTRACT_TYPE = "muse-watch.contract";
 const OPEN_TODO = new Set(["pending", "in_progress"]);
+const STOP_WHEN_RE = /I(?:['’]ll| will) stop when\s+(.+?)(?:\.|$)/i;
+const PR_URL_RE = /github\.com\/[^\s)\]>'"]+\/pull\/\d+/i;
+const NEEDS_PR_RE = /\bpr\b|pull request|pr url/i;
+const USER_WAIT_RE =
+  /\b(you confirm|your answer|the user|user replies|you say|wait for (?:the )?user)\b/i;
 const STALL_MS = parseDurationEnv("OMO_MUSE_STALL_MS", 40_000);
 const IDLE_TODO_MS = parseDurationEnv("OMO_MUSE_IDLE_TODO_MS", 8_000);
 const TICK_MS = 5_000;
@@ -147,9 +154,67 @@ function readPhases(payload) {
   return payload.phases;
 }
 
+function branchEntries(ctx) {
+  return ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
+}
+
+function assistantText(entry) {
+  const message = entry?.type === "message" ? entry.message : entry;
+  if (!message || message.role !== "assistant") return "";
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function extractStopWhen(text) {
+  if (!text) return "";
+  const match = STOP_WHEN_RE.exec(text);
+  if (!match) return "";
+  return match[1].trim().replace(/\s+/g, " ").slice(0, 400);
+}
+
+function latestContract(entries) {
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i];
+    if (entry?.type === "custom" && entry.customType === CONTRACT_TYPE && entry.data?.when) {
+      return entry.data;
+    }
+  }
+  return null;
+}
+
+function transcriptHasPull(entries) {
+  for (const entry of entries) {
+    const raw = JSON.stringify(entry?.message?.content ?? entry?.content ?? entry?.data ?? "");
+    if (PR_URL_RE.test(raw)) return true;
+  }
+  return false;
+}
+
+function persistContract(pi, ctx) {
+  const entries = branchEntries(ctx);
+  let when = "";
+  for (const entry of entries) {
+    const found = extractStopWhen(assistantText(entry));
+    if (found) when = found;
+  }
+  if (!when) return null;
+  const prev = latestContract(entries);
+  if (prev?.when === when) return prev;
+  try {
+    pi.appendEntry(CONTRACT_TYPE, { when, at: Date.now() });
+  } catch {
+    return { when, at: Date.now() };
+  }
+  return { when, at: Date.now() };
+}
+
 function latestOpenTodos(ctx) {
-  const entries =
-    ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
+  const entries = branchEntries(ctx);
   let tasks = [];
   for (const entry of entries) {
     if (entry?.type === "custom" && entry.customType === TODO_STATE_TYPE) {
@@ -168,6 +233,19 @@ function latestOpenTodos(ctx) {
     .map((task) => task.content);
 }
 
+function unfinishedWork(ctx) {
+  const open = latestOpenTodos(ctx);
+  if (open.length > 0) return { kind: "todos", open };
+  const entries = branchEntries(ctx);
+  const contract = latestContract(entries);
+  if (!contract?.when) return null;
+  if (USER_WAIT_RE.test(contract.when)) return null;
+  if (NEEDS_PR_RE.test(contract.when) && !transcriptHasPull(entries)) {
+    return { kind: "contract", open: [`I'll stop when ${contract.when}`] };
+  }
+  return null;
+}
+
 function lastAssistantStopReason(event) {
   const messages = Array.isArray(event?.messages) ? event.messages : [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -176,16 +254,21 @@ function lastAssistantStopReason(event) {
   return undefined;
 }
 
-function prematurePrompt(open) {
+function prematurePrompt(work) {
+  const open = work.open;
   const listed = open
     .slice(0, 8)
     .map((item) => `- ${item}`)
     .join("\n");
   const extra = open.length > 8 ? `\n- …and ${open.length - 8} more` : "";
+  const head =
+    work.kind === "contract"
+      ? "You ended the turn before your declared stop-when contract held. That is a premature stop."
+      : "You ended the turn while todo work is still open. That is a premature stop.";
   return [
-    "You ended the turn while todo work is still open. That is a premature stop.",
+    head,
     "Continue the same task now. Do not wait for the user. Do not restart from scratch.",
-    "Open todos:",
+    work.kind === "contract" ? "Unmet contract:" : "Open todos:",
     listed + extra,
   ].join("\n");
 }
@@ -246,17 +329,18 @@ export default function (pi) {
       return false;
     }
 
-    const open = latestOpenTodos(ctx);
-    if (open.length === 0) {
-      lastSkip = "no-open-todos";
+    persistContract(pi, ctx);
+    const work = unfinishedWork(ctx);
+    if (!work) {
+      lastSkip = "no-unfinished";
       return false;
     }
 
-    lastTodoSig = open.join("\n");
+    lastTodoSig = work.open.join("\n");
     lastPrematureTrip = Date.now();
     prematureTrips += 1;
     pending = true;
-    const toast = `muse ${label} with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`;
+    const toast = `muse ${label} ${work.kind} x${work.open.length} — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`;
     notify(ctx, toast, "warning");
     setWatchStatus(ctx, toast);
 
@@ -264,8 +348,8 @@ export default function (pi) {
     const send = () => {
       try {
         const result = idle
-          ? pi.sendUserMessage(prematurePrompt(open))
-          : pi.sendUserMessage(prematurePrompt(open), { deliverAs: "followUp" });
+          ? pi.sendUserMessage(prematurePrompt(work))
+          : pi.sendUserMessage(prematurePrompt(work), { deliverAs: "followUp" });
         if (result && typeof result.then === "function") {
           result.catch((error) => {
             lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
@@ -360,6 +444,11 @@ export default function (pi) {
   pi.on("tool_execution_end", bump);
   pi.on("agent_start", bump);
   pi.on("turn_start", bump);
+  pi.on("message_end", (event, ctx) => {
+    bump(event, ctx);
+    if (event?.message?.role !== "assistant") return;
+    persistContract(pi, ctx);
+  });
 
   pi.on("session_shutdown", () => {
     stopTimers();
@@ -378,14 +467,18 @@ export default function (pi) {
     lastTodoSig = "";
     lastSkip = "";
     stopTimers();
-    const openAtStart = latestOpenTodos(ctx);
+    persistContract(pi, ctx);
+    const work = unfinishedWork(ctx);
     const blob = modelBlob(ctx) || "no-model";
-    setWatchStatus(ctx, `armed ${blob} todos=${openAtStart.length}`);
+    setWatchStatus(
+      ctx,
+      `armed ${blob} todos=${latestOpenTodos(ctx).length} contract=${work?.kind === "contract" ? "unmet" : "none"}`,
+    );
     ensureTicker(ctx);
     const kicked = kickPremature(ctx, "resume");
     if (kicked) return;
-    if (openAtStart.length === 0) return;
-    const skipText = `resume skipped (${lastSkip}) todos=${openAtStart.length}`;
+    if (!work) return;
+    const skipText = `resume skipped (${lastSkip}) ${work.kind}`;
     setWatchStatus(ctx, skipText);
     notify(ctx, `muse-watch ${skipText}`, "warning");
   });
@@ -394,8 +487,9 @@ export default function (pi) {
     description: "Show muse-watch model/todo status",
     handler: (_args, ctx) => {
       liveCtx = ctx;
-      const open = latestOpenTodos(ctx);
-      const text = `model=${modelBlob(ctx) || "none"} muse=${isMuse(ctx)} idle=${ctx.isIdle?.()} todos=${open.length} skip=${lastSkip || "-"} trips=${prematureTrips}`;
+      persistContract(pi, ctx);
+      const work = unfinishedWork(ctx);
+      const text = `model=${modelBlob(ctx) || "none"} muse=${isMuse(ctx)} idle=${ctx.isIdle?.()} unfinished=${work ? work.kind : "none"} skip=${lastSkip || "-"} trips=${prematureTrips}`;
       setWatchStatus(ctx, text);
       notify(ctx, text, "info");
     },
