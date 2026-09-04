@@ -87,9 +87,13 @@ cp muse-watch.js ~/.omo/agent/extensions/
 파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. **이미 `❯` 로 죽은 칸은 프로세스 안 훅이 못 본다.** 그건 Herdr 바깥 키커가 민다.
 
 ```bash
-# mdc-server / 이 PC
-python3 idle-todo-kick.py          # 루프
-python3 idle-todo-kick.py --once   # 한 바퀴
+# Linux
+python3 idle-todo-kick.py --daemon
+python3 idle-todo-kick.py --once
+
+# Windows — pythonw 로 콘솔 없이. herdr 호출도 CREATE_NO_WINDOW.
+python idle-todo-kick.py --daemon
+python idle-todo-kick.py --once
 ```
 
 idle + muse + 열린 todo 면 continue 를 넣는다. `omo -r` 은 필요 없다.

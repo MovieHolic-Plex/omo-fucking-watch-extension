@@ -70,9 +70,16 @@ def log(message: str) -> None:
         pass
 
 
+def hidden_run_kwargs() -> dict:
+    """Keep herdr/python from flashing a console on Windows."""
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+
+
 def herdr(*args: str) -> str:
     env = os.environ.copy()
-    extra = "/home/main/.local/bin"
+    extra = str(Path.home() / ".local" / "bin")
     env["PATH"] = extra + os.pathsep + env.get("PATH", "")
     completed = subprocess.run(
         [HERDR, *args],
@@ -82,6 +89,7 @@ def herdr(*args: str) -> str:
         encoding="utf-8",
         errors="replace",
         env=env,
+        **hidden_run_kwargs(),
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or f"herdr {' '.join(args)} failed")
@@ -214,10 +222,49 @@ def tick(state: dict) -> dict:
     return state
 
 
+def pythonw_executable() -> str:
+    exe = Path(sys.executable)
+    if os.name == "nt":
+        candidate = exe.with_name("pythonw.exe")
+        if candidate.exists():
+            return str(candidate)
+    return str(exe)
+
+
+def spawn_daemon() -> int:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pid_path = Path(os.environ.get("OMO_IDLE_TODO_KICK_PID", str(STATE_PATH.with_name("idle-todo-kick.pid"))))
+    child_args = [a for a in sys.argv[1:] if a != "--daemon"]
+    cmd = [pythonw_executable(), str(Path(__file__).resolve()), *child_args]
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    out = LOG_PATH.open("a", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=out,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=flags,
+        start_new_session=os.name != "nt",
+        **({} if os.name == "nt" else {}),
+    )
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    log(f"daemon {proc.pid} {cmd[0]}")
+    print(f"started {proc.pid} (headless)", flush=True)
+    return 0
+
+
 def main() -> int:
     if not enabled():
         log("disabled")
         return 0
+    if "--daemon" in sys.argv:
+        return spawn_daemon()
     once = "--once" in sys.argv
     dry = "--dry-run" in sys.argv
     state = load_state()

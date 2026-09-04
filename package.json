@@ -1,6 +1,6 @@
 {
   "name": "omo-fucking-watch-extension",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Senpi/OmO extension: abort silent muse-spark hangs on the main session and continue the same turn.",
   "type": "module",
   "license": "MIT",
