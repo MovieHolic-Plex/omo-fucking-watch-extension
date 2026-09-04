@@ -84,7 +84,15 @@ copy muse-watch.js %USERPROFILE%\.omo\agent\extensions\
 cp muse-watch.js ~/.omo/agent/extensions/
 ```
 
-파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. idle이어도 열린 todo를 폴링한다. `omo -r` 은 필요 없다. 토스트 `muse idle with N open todo(s)` 가 보이면 그 칸을 다시 돌린 것이다.
+파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. **이미 `❯` 로 죽은 칸은 프로세스 안 훅이 못 본다.** 그건 Herdr 바깥 키커가 민다.
+
+```bash
+# mdc-server / 이 PC
+python3 idle-todo-kick.py          # 루프
+python3 idle-todo-kick.py --once   # 한 바퀴
+```
+
+idle + muse + 열린 todo 면 continue 를 넣는다. `omo -r` 은 필요 없다.
 
 예전 레포 URL `MovieHolic-Plex/omo-free-muse-extension` 은 GitHub가 여기로 리다이렉트한다.
 
@@ -107,9 +115,10 @@ Senpi 는 `ctx.model` 이다. omp 의 `ctx.models.current()` / `ctx.setTimeout` 
 | 상황 | 담당 |
 | --- | --- |
 | 메인 칸 Muse 가 말없이 멈춤 | **이 익스텐션** (hang) |
-| 메인 칸 Muse 가 todo 남기고 프롬프트로 복귀 | **이 익스텐션** (조기 정지) |
+| 메인 칸 Muse 가 todo 남기고 프롬프트로 복귀 | **이 익스텐션** + **idle-todo-kick.py** |
 | HTTP 에러 / 첫 토큰 타임아웃 | `settings.json` `retry.fallbackChains` |
 | `task` 로 띄운 백그라운드 Muse 워커 | `is_unstable_agent` + babysitter + category `models[]` |
+| 이미 `❯` idle 인데 todo 가 남음 | **idle-todo-kick.py** (Herdr 바깥) |
 | omo 프로세스 자체 사망 | 훅도 같이 죽음. Herdr 바깥 감시 |
 
 `is_unstable_agent: true` 카테고리 워커는 부모가 idle 이라 워치독이 스킵한다. 그 구멍은 fallback 체인 몫이다.
@@ -181,6 +190,10 @@ Muse 턴
 | `OMO_MUSE_WATCH` | on | `0` / `false` / `off` 이면 비활성 |
 | `OMO_MUSE_STALL_MS` | `40000` | 무음 판정. 최소 1000 |
 | `OMO_MUSE_IDLE_TODO_MS` | `8000` | idle 에서 todo continue 하기 전 유예 |
+| `OMO_IDLE_TODO_KICK` | on | Herdr 바깥 키커. `0` 이면 끔 |
+| `OMO_IDLE_TODO_KICK_EVERY_MS` | `15000` | 바깥 키커 폴링 |
+| `OMO_IDLE_TODO_KICK_COOLDOWN_MS` | `90000` | 같은 칸 재kick 간격 |
+| `OMO_IDLE_TODO_KICK_MAX` | `6` | 같은 todo 서명당 최대 kick |
 
 의존성 없음. 파일 하나. `muse-watch.js`.
 
