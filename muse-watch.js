@@ -3,11 +3,13 @@
  *
  * 1. Silent hang: live model is muse-spark, the parent loop is not idle, and
  *    no stream/tool activity arrives for STALL_MS → abort + continue.
- * 2. Premature stop: muse ends a turn cleanly while pending/in_progress todos
- *    remain → follow-up so the same work keeps going.
+ * 2. Premature stop: muse ends a turn, or sits idle, while pending/in_progress
+ *    todos remain → follow-up so the same work keeps going. Idle sessions are
+ *    polled; omo -r is not required.
  *
  * Disable: OMO_MUSE_WATCH=0
  * Tune:    OMO_MUSE_STALL_MS (default 40000)
+ *          OMO_MUSE_IDLE_TODO_MS (default 8000) — idle grace before todo kick
  *
  * Use ctx.setInterval / ctx.setTimeout only. A raw timer throw tears down
  * the whole session.
@@ -17,6 +19,7 @@ const MUSE_RE = /muse-spark/i;
 const TODO_STATE_TYPE = "senpi.todo-state";
 const OPEN_TODO = new Set(["pending", "in_progress"]);
 const STALL_MS = parseDurationEnv("OMO_MUSE_STALL_MS", 40_000);
+const IDLE_TODO_MS = parseDurationEnv("OMO_MUSE_IDLE_TODO_MS", 8_000);
 const TICK_MS = 5_000;
 const COOLDOWN_MS = 60_000;
 const MAX_STALL_TRIPS = 4;
@@ -116,6 +119,7 @@ export default function (pi) {
 
   let lastActivity = Date.now();
   let lastStallTrip = 0;
+  let lastPrematureTrip = 0;
   let stallTrips = 0;
   let prematureTrips = 0;
   let pending = false;
@@ -125,6 +129,94 @@ export default function (pi) {
   const bump = () => {
     lastActivity = Date.now();
   };
+
+  function kickPremature(ctx, label) {
+    if (pending) return false;
+    if (!isMuse(ctx)) return false;
+    if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) return false;
+    if (prematureTrips >= MAX_PREMATURE_TRIPS) return false;
+    if (Date.now() - lastPrematureTrip < COOLDOWN_MS && prematureTrips > 0) return false;
+
+    const open = latestOpenTodos(ctx);
+    if (open.length === 0) return false;
+
+    lastTodoSig = open.join("\n");
+    lastPrematureTrip = Date.now();
+    prematureTrips += 1;
+    pending = true;
+    notify(
+      ctx,
+      `muse ${label} with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`,
+      "warning",
+    );
+
+    ctx.setTimeout(() => {
+      try {
+        pi.sendUserMessage(prematurePrompt(open), {
+          deliverAs: "followUp",
+          triggerTurn: true,
+        });
+      } catch {
+        // follow-up is best effort
+      } finally {
+        bump();
+        pending = false;
+      }
+    }, 400);
+    return true;
+  }
+
+  function tick(ctx) {
+    if (pending) return;
+    if (!isMuse(ctx)) return;
+
+    const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
+    if (idle) {
+      if (Date.now() - lastActivity < IDLE_TODO_MS) return;
+      kickPremature(ctx, "idle");
+      return;
+    }
+
+    if (stallTrips >= MAX_STALL_TRIPS) return;
+    const silent = Date.now() - lastActivity;
+    if (silent < STALL_MS) return;
+    if (Date.now() - lastStallTrip < COOLDOWN_MS) return;
+
+    pending = true;
+    lastStallTrip = Date.now();
+    stallTrips += 1;
+    notify(
+      ctx,
+      `muse stalled ${Math.round(silent / 1000)}s — abort ${stallTrips}/${MAX_STALL_TRIPS}`,
+      "warning",
+    );
+
+    try {
+      ctx.abort?.();
+    } catch {
+      pending = false;
+      return;
+    }
+
+    ctx.setTimeout(() => {
+      try {
+        pi.sendUserMessage(STALL_PROMPT, {
+          deliverAs: "followUp",
+          triggerTurn: true,
+        });
+      } catch {
+        // follow-up is best effort
+      } finally {
+        bump();
+        pending = false;
+      }
+    }, 1200);
+  }
+
+  function ensureTicker(ctx) {
+    if (stallTimer || typeof ctx.setInterval !== "function") return;
+    stallTimer = ctx.setInterval(() => tick(ctx), TICK_MS);
+  }
 
   pi.on("message_update", bump);
   pi.on("message_start", bump);
@@ -143,121 +235,27 @@ export default function (pi) {
   pi.on("session_start", (_event, ctx) => {
     lastActivity = Date.now();
     lastStallTrip = 0;
+    lastPrematureTrip = 0;
     stallTrips = 0;
     prematureTrips = 0;
     pending = false;
     lastTodoSig = "";
-    if (stallTimer && typeof ctx.clearTimer === "function") ctx.clearTimer(stallTimer);
-
+    if (stallTimer && typeof ctx.clearTimer === "function") {
+      ctx.clearTimer(stallTimer);
+      stallTimer = undefined;
+    }
+    ensureTicker(ctx);
     ctx.setTimeout(() => {
-      if (pending) return;
-      if (!isMuse(ctx)) return;
-      if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) return;
-      const open = latestOpenTodos(ctx);
-      if (open.length === 0) return;
-      if (prematureTrips >= MAX_PREMATURE_TRIPS) return;
-      lastTodoSig = open.join("\n");
-      prematureTrips += 1;
-      pending = true;
-      notify(
-        ctx,
-        `muse resume with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`,
-        "info",
-      );
-      try {
-        pi.sendUserMessage(prematurePrompt(open), {
-          deliverAs: "followUp",
-          triggerTurn: true,
-        });
-      } catch {
-        // follow-up is best effort
-      } finally {
-        bump();
-        pending = false;
-      }
+      kickPremature(ctx, "resume");
     }, 800);
-
-    stallTimer = ctx.setInterval(() => {
-      if (pending) return;
-      if (!isMuse(ctx)) return;
-      if (typeof ctx.isIdle === "function" && ctx.isIdle()) return;
-      if (stallTrips >= MAX_STALL_TRIPS) return;
-
-      const silent = Date.now() - lastActivity;
-      if (silent < STALL_MS) return;
-      if (Date.now() - lastStallTrip < COOLDOWN_MS) return;
-
-      pending = true;
-      lastStallTrip = Date.now();
-      stallTrips += 1;
-      notify(
-        ctx,
-        `muse stalled ${Math.round(silent / 1000)}s — abort ${stallTrips}/${MAX_STALL_TRIPS}`,
-        "warning",
-      );
-
-      try {
-        ctx.abort?.();
-      } catch {
-        pending = false;
-        return;
-      }
-
-      ctx.setTimeout(() => {
-        try {
-          pi.sendUserMessage(STALL_PROMPT, {
-            deliverAs: "followUp",
-            triggerTurn: true,
-          });
-        } catch {
-          // follow-up is best effort
-        } finally {
-          bump();
-          pending = false;
-        }
-      }, 1200);
-    }, TICK_MS);
   });
 
   pi.on("agent_end", (event, ctx) => {
+    ensureTicker(ctx);
     if (event?.willRetry === true) return;
     if (event?.aborted === true && event.abortSource === "user") return;
-    if (pending) return;
-    if (!isMuse(ctx)) return;
-    if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) return;
-    if (prematureTrips >= MAX_PREMATURE_TRIPS) return;
-
     const reason = lastAssistantStopReason(event);
     if (reason && reason !== "stop" && reason !== "length") return;
-
-    const open = latestOpenTodos(ctx);
-    if (open.length === 0) return;
-
-    const sig = open.join("\n");
-    if (sig === lastTodoSig && prematureTrips > 0) {
-      // same leftover list as last kick; still count, then stop if we cap
-    }
-    lastTodoSig = sig;
-    prematureTrips += 1;
-    pending = true;
-    notify(
-      ctx,
-      `muse stopped with ${open.length} open todo(s) — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`,
-      "warning",
-    );
-
-    ctx.setTimeout(() => {
-      try {
-        pi.sendUserMessage(prematurePrompt(open), {
-          deliverAs: "followUp",
-          triggerTurn: true,
-        });
-      } catch {
-        // follow-up is best effort
-      } finally {
-        bump();
-        pending = false;
-      }
-    }, 400);
+    kickPremature(ctx, "stopped");
   });
 }

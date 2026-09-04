@@ -84,7 +84,7 @@ copy muse-watch.js %USERPROFILE%\.omo\agent\extensions\
 cp muse-watch.js ~/.omo/agent/extensions/
 ```
 
-**이미 켜져 있는 omo 칸은 재시작해야** 붙는다. 토스트 `muse stalled … abort 1/4` 가 보이면 살아있는 것이다.
+익스텐션 파일이 로드된 세션은 **idle이어도** 열린 todo를 폴링한다. `omo -r` 은 필요 없다. 토스트 `muse idle with N open todo(s)` 가 보이면 그 칸을 다시 돌린 것이다.
 
 ## 무엇을 하나
 
@@ -92,8 +92,7 @@ cp muse-watch.js ~/.omo/agent/extensions/
 
 **1. Silent hang** — 루프가 아직 도는데 스트림·툴이 40초 동안 없으면 abort 하고 이어서 돌린다.
 
-**2. 조기 정지** — 턴이 정상 종료됐는데 `pending` / `in_progress` todo 가 남아 있으면 follow-up 으로 같은 일을 계속한다.  
-예: *「순서대로 뜯겠습니다」* 하고 `❯` 로 돌아온 omo-3.
+**2. 조기 정지** — 턴이 끝났거나 이미 `❯` idle 인데 `pending` / `in_progress` todo 가 남아 있으면 follow-up 으로 같은 일을 계속한다. idle 은 약 8초 뒤에 폴링한다.
 
 둘 다 토스트가 뜬다. hang 은 세션당 4번, 조기 정지는 6번까지.
 
@@ -117,9 +116,9 @@ cp muse-watch.js ~/.omo/agent/extensions/
 hang (every 5s)
   ├─ muse + not idle + 40s silent → abort → continue
 
-조기 정지 (agent_end)
-  ├─ muse + 열린 todo + 사용자 abort 아님
-  └─ follow-up: 남은 todo 목록과 함께 계속
+조기 정지
+  ├─ agent_end: muse + 열린 todo
+  └─ idle poll: muse + ❯ + 열린 todo (8s 유예)
 ```
 
 타이머는 반드시 `ctx.setInterval` / `ctx.setTimeout` 이다. 일반 `setInterval` 이 던지면 **세션 전체가 죽는다.**
@@ -176,6 +175,7 @@ Muse 턴
 | --- | --- | --- |
 | `OMO_MUSE_WATCH` | on | `0` / `false` / `off` 이면 비활성 |
 | `OMO_MUSE_STALL_MS` | `40000` | 무음 판정. 최소 1000 |
+| `OMO_MUSE_IDLE_TODO_MS` | `8000` | idle 에서 todo continue 하기 전 유예 |
 
 의존성 없음. 파일 하나.
 
