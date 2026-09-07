@@ -24,7 +24,7 @@ const MAX_STALL_WARNINGS = 4;
 
 function stallDuration() {
   const value = Number(process.env.OMO_MUSE_STALL_MS);
-  return Number.isSafeInteger(value) && value >= 1_000 ? value : 40_000;
+  return Number.isSafeInteger(value) && value >= 1_000 ? value : 180_000;
 }
 
 function sessionId(ctx) {
