@@ -26,12 +26,14 @@
   "files": [
     "muse-watch.js",
     "idle-todo-kick.py",
+    "systemd",
     "LICENSE",
     "README.md",
     "assets"
   ],
   "scripts": {
-    "check": "node --check muse-watch.js"
+    "check": "node --check muse-watch.js && npm test",
+    "test": "node --test test/muse-watch.test.js && python3 -m unittest discover -s test -p 'test_*.py'"
   },
   "engines": {
     "node": ">=18"

@@ -86,6 +86,11 @@ cp muse-watch.js ~/.omo/agent/extensions/
 
 파일을 바꾼 뒤에는 그 칸에서 `/reload` 한 번이면 된다. **이미 `❯` 로 죽은 칸은 프로세스 안 훅이 못 본다.** 그건 Herdr 바깥 키커가 민다.
 
+수동 파일 설치와 `omo install`은 둘 중 하나만 사용한다. 두 방식으로 같은 확장을
+동시에 로드하면 감시와 continue가 중복될 수 있다. `/muse-watch`로 현재 모델과
+미완료 작업 상태를 확인한다. `muse=false`는 비활성 오류가 아니라 Muse 외 모델을
+건드리지 않는 정상 상태다.
+
 ```bash
 # Linux
 python3 idle-todo-kick.py --daemon
@@ -97,6 +102,29 @@ python idle-todo-kick.py --once
 ```
 
 idle + muse + 열린 todo 면 continue 를 넣는다. `omo -r` 은 필요 없다.
+
+### Linux에서 외부 감시기 상시 실행
+
+`--daemon`은 한 번 실행할 뿐, 종료 후 자동 복구나 로그인 시 시작을 등록하지 않는다.
+상시 실행에는 사용자 systemd 서비스를 사용한다. Herdr가 실행 중이어야 하며,
+아래 서비스와 `--daemon`을 동시에 실행하지 않는다.
+
+```bash
+git clone https://github.com/MovieHolic-Plex/omo-fucking-watch-extension ~/omo-fucking-watch-extension
+cd ~/omo-fucking-watch-extension
+python3 idle-todo-kick.py --dry-run
+mkdir -p ~/.config/systemd/user
+cp systemd/omo-idle-todo-kick.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now omo-idle-todo-kick.service
+systemctl --user status omo-idle-todo-kick.service
+```
+
+다른 경로에 복제했다면 서비스의 `ExecStart` 경로를 바꾼다.
+`--dry-run`은 실제 Herdr 화면을 읽지만 continue를 보내지 않는다.
+로그는 `journalctl --user -u omo-idle-todo-kick.service`에서 확인하고,
+중지와 자동 시작 해제는 `systemctl --user disable --now omo-idle-todo-kick.service`로 한다.
+이미 열린 OmO 세션의 확장 코드를 갱신하려면 각 세션에서 `/reload`가 필요하다.
 
 예전 레포 URL `MovieHolic-Plex/omo-free-muse-extension` 은 GitHub가 여기로 리다이렉트한다.
 
@@ -114,6 +142,15 @@ idle + muse + 열린 todo 면 continue 를 넣는다. `omo -r` 은 필요 없다
 wish-ai-3 처럼 todo 를 안 남기고 끊긴 칸은, 말 꼬리를 추측하지 않는다. 선언한 stop-when 을 state 로 저장한 뒤 그게 안 채워졌는지만 본다.
 
 둘 다 토스트가 뜬다. hang 은 세션당 4번, 조기 정지는 6번까지.
+
+프로세스 내부 워치는 실행 중인 도구와 엔진 retry를 무음 정지로 오인하지 않는다.
+사용자 abort 뒤에는 새 실행이 시작될 때까지 자동 재개를 멈추며,
+모델을 확인할 수 없을 때도 임의로 Muse라고 가정하지 않는다.
+`no PR/merge`처럼 명시적으로 제외한 PR은 미충족 조건으로 잡지 않는다.
+
+외부 키커의 종료 조건 조회는 Herdr가 알려 준 정확한 세션 ID/경로를 우선한다.
+그 정보가 없으면 같은 CWD에 세션이 하나뿐인 경우에만 조회하며, 여러 세션 중
+최신 파일을 추측해서 다른 칸을 재개하지 않는다. Herdr 호출은 10초로 제한한다.
 
 Senpi 는 `ctx.model` 이다. omp 의 `ctx.models.current()` / `ctx.setTimeout` 만 보고 짜면 `/reload` 해도 안 돈다. 이 워치는 둘 다 받는다.
 
@@ -206,6 +243,12 @@ Muse 턴
 | `OMO_IDLE_TODO_KICK_MAX` | `6` | 같은 todo 서명당 최대 kick |
 
 의존성 없음. 파일 하나. `muse-watch.js`.
+
+## 검증
+
+Node.js와 Python 3가 설치된 환경에서 `npm run check`를 실행한다.
+JavaScript 구문 검사, 가상 타이머 기반 확장 이벤트 회귀 테스트,
+외부 감시기 Python 단위 테스트를 함께 실행하며 모델 API 호출은 하지 않는다.
 
 ## 라이선스
 

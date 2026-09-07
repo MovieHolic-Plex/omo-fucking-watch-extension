@@ -1,0 +1,12 @@
+[Unit]
+Description=OmO Muse idle todo watchdog
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/omo-fucking-watch-extension/idle-todo-kick.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
