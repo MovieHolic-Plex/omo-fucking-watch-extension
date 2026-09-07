@@ -1,7 +1,7 @@
 {
   "name": "omo-fucking-watch-extension",
   "version": "0.2.0",
-  "description": "Senpi/OmO extension: abort silent muse-spark hangs on the main session and continue the same turn.",
+  "description": "Senpi/OmO extension: Muse stall warnings and guarded, explicit manual continuation.",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/MovieHolic-Plex/omo-fucking-watch-extension",
@@ -26,14 +26,14 @@
   "files": [
     "muse-watch.js",
     "idle-todo-kick.py",
-    "systemd",
     "LICENSE",
     "README.md",
     "assets"
   ],
   "scripts": {
     "check": "node --check muse-watch.js && npm test",
-    "test": "node --test test/muse-watch.test.js && python3 -m unittest discover -s test -p 'test_*.py'"
+    "test": "node --test test/muse-watch.test.js && python3 -m unittest discover -s test -p 'test_*.py'",
+    "test:runtime": "node test/runtime-smoke.mjs"
   },
   "engines": {
     "node": ">=18"

@@ -1,549 +1,390 @@
 /**
- * Muse stall + premature-stop watchdog for omo (senpi).
+ * Fail-closed Muse watchdog for installed Senpi extension APIs.
  *
- * 1. Silent hang: live model is muse-spark, the parent loop is not idle, and
- *    no stream/tool activity arrives for STALL_MS → abort + continue.
- * 2. Premature stop: muse ends a turn, or sits idle, while pending/in_progress
- *    todos remain, OR a declared "I'll stop when …" contract is still unmet
- *    (no todo-state, like wish-ai-3). The contract is persisted as
- *    muse-watch.contract so later ticks read state, not vibes.
- *
- * Disable: OMO_MUSE_WATCH=0
- * Tune:    OMO_MUSE_STALL_MS (default 40000)
- *          OMO_MUSE_IDLE_TODO_MS (default 8000) — idle grace before todo kick
- *
- * Senpi ExtensionContext has `ctx.model` and no ctx.setTimeout/setInterval.
- * omp has ctx.models.current() plus contained timers. Use whichever exists.
- * Raw timers must catch throws and be cleared on session_shutdown, or a stale
- * ctx after /reload becomes an uncaughtException that kills the session.
+ * There is no extension-facing snapshot of pending completion deliveries.
+ * Therefore timers and lifecycle callbacks NEVER abort or send a continuation.
+ * They only warn about silent runs. A manual continuation requires explicit
+ * acknowledgement, native-queue/draft checks, and a persisted at-most-once claim.
+ * OMO_MUSE_WATCH=0 disables the extension; OMO_MUSE_STALL_MS tunes warnings.
  */
+import { isAbsolute } from "node:path";
 
-const MUSE_RE = /muse-spark/i;
-const TODO_STATE_TYPE = "senpi.todo-state";
-const CONTRACT_TYPE = "muse-watch.contract";
-const OPEN_TODO = new Set(["pending", "in_progress"]);
-const STOP_WHEN_RE = /I(?:['’]ll| will) stop when\s+(.+?)(?:\.|$)/i;
-const PR_URL_RE = /github\.com\/[^\s)\]>'"]+\/pull\/\d+/i;
-const NEEDS_PR_RE = /\bpr\b|pull request|pr url/i;
-const NO_PR_RE =
-  /\b(?:no|without|not|never|do not|don['’]t)\s+(?:(?:open(?:ing)?|creat(?:e|ing)|rais(?:e|ing)|submit(?:ting)?)\s+)?(?:(?:a|an|the|any|another)\s+)?(?:pr(?:\s+url)?|pull request)\b|\b(?:pr(?:\s+url)?|pull request)\s+(?:is\s+)?(?:not\s+(?:needed|required)|unnecessary)\b/gi;
-const USER_WAIT_RE =
-  /\b(you confirm|your answer|the user|user replies|you say|wait for (?:the )?user)\b/i;
-const STALL_MS = parseDurationEnv("OMO_MUSE_STALL_MS", 40_000);
-const IDLE_TODO_MS = parseDurationEnv("OMO_MUSE_IDLE_TODO_MS", 8_000);
+const STATE_TYPE = "muse-watch.state";
+const TODO_TYPE = "senpi.todo-state";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SUPPORTED_MODELS = new Set([
+  "muse/muse-spark-1.3-contributor-free",
+  "cliproxy/muse-spark-1.3-contributor-free",
+]);
+const STATUSES = new Set(["pending", "in_progress", "completed", "abandoned", "cancelled"]);
+const OWNERS = Symbol.for("omo.muse-watch.owners.v1");
+const STALE_PREFIX = "This extension ctx is stale after session replacement or reload.";
 const TICK_MS = 5_000;
-const COOLDOWN_MS = 60_000;
-const MAX_STALL_TRIPS = 4;
-const MAX_PREMATURE_TRIPS = 6;
-const STALE_CTX_PREFIX = "This extension ctx is stale after session replacement or reload.";
-const STALL_PROMPT =
-  "Previous model stalled with no stream activity. Continue the same task from where it stopped. Do not restart from scratch.";
+const MAX_STALL_WARNINGS = 4;
 
-function parseDurationEnv(name, fallback) {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < 1_000) return fallback;
-  return parsed;
+function stallDuration() {
+  const value = Number(process.env.OMO_MUSE_STALL_MS);
+  return Number.isSafeInteger(value) && value >= 1_000 ? value : 40_000;
 }
 
-function enabled() {
-  const raw = process.env.OMO_MUSE_WATCH;
-  if (raw == null || raw === "") return true;
-  return !["0", "false", "off", "no"].includes(raw.toLowerCase());
+function sessionId(ctx) {
+  const id = ctx.sessionManager?.getSessionId?.();
+  return typeof id === "string" && UUID.test(id) ? id : undefined;
 }
 
-function modelBlob(ctx) {
-  try {
-    const model = ctx?.model ?? ctx?.models?.current?.();
-    if (model) {
-      if (typeof model === "string") return model;
-      const blob = [model.id, model.provider, model.name, model.api, model.displayName]
-        .filter(Boolean)
-        .join(" ");
-      if (blob) return blob;
-    }
-  } catch {
-    // fall through to session history
-  }
-  try {
-    const entries =
-      ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.() ?? [];
-    for (let i = entries.length - 1; i >= 0; i -= 1) {
-      const entry = entries[i];
-      if (entry?.type !== "model_change") continue;
-      return [entry.modelId, entry.provider, entry.model].filter(Boolean).join(" ");
-    }
-  } catch {
-    // ignore
-  }
-  return "";
-}
-
-function isMuse(ctx) {
-  return MUSE_RE.test(modelBlob(ctx));
-}
-
-function isStaleCtxError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith(STALE_CTX_PREFIX);
-}
-
-function notify(ctx, message, kind = "warning") {
-  try {
-    if (ctx.hasUI) ctx.ui.notify(message, kind);
-  } catch {
-    // rpc / headless / stale
-  }
-}
-
-function setWatchStatus(ctx, text) {
-  try {
-    ctx.ui?.setStatus?.("muse-watch", text);
-  } catch {
-    // no footer
-  }
-}
-
-function scheduleTimeout(ctx, fn, ms) {
-  const run = () => {
-    try {
-      fn();
-    } catch (error) {
-      if (isStaleCtxError(error)) return;
-    }
-  };
-  if (ctx && typeof ctx.setTimeout === "function") {
-    return { kind: "ctx", id: ctx.setTimeout(run, ms), ctx };
-  }
-  return { kind: "raw", id: setTimeout(run, ms) };
-}
-
-function scheduleInterval(ctx, fn, ms) {
-  const run = () => {
-    try {
-      fn();
-    } catch (error) {
-      if (isStaleCtxError(error)) return;
-    }
-  };
-  if (ctx && typeof ctx.setInterval === "function") {
-    return { kind: "ctx", id: ctx.setInterval(run, ms), ctx };
-  }
-  return { kind: "raw", id: setInterval(run, ms) };
-}
-
-function clearScheduled(timer) {
-  if (!timer) return;
-  try {
-    if (timer.kind === "ctx") {
-      timer.ctx.clearTimer?.(timer.id);
-    } else {
-      clearTimeout(timer.id);
-      clearInterval(timer.id);
-    }
-  } catch {
-    // already gone
-  }
-}
-
-function readPhases(payload) {
-  if (!payload || typeof payload !== "object") return null;
-  if (!Array.isArray(payload.phases)) return null;
-  return payload.phases;
-}
-
-function branchEntries(ctx) {
-  return ctx.sessionManager?.getBranch?.() ?? ctx.sessionManager?.getEntries?.() ?? [];
-}
-
-function assistantText(entry) {
-  const message = entry?.type === "message" ? entry.message : entry;
-  if (!message || message.role !== "assistant") return "";
-  const content = message.content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((block) => block && block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("\n");
-}
-
-function extractStopWhen(text) {
-  if (!text) return "";
-  const match = STOP_WHEN_RE.exec(text);
-  if (!match) return "";
-  return match[1].trim().replace(/\s+/g, " ").slice(0, 400);
-}
-
-function latestContract(entries) {
-  for (let i = entries.length - 1; i >= 0; i -= 1) {
-    const entry = entries[i];
-    if (entry?.type === "custom" && entry.customType === CONTRACT_TYPE && entry.data?.when) {
-      return entry.data;
-    }
-  }
-  return null;
-}
-
-function transcriptHasPull(entries) {
+function readState(entries, id) {
+  let state = { version: 1, sessionId: id, paused: true, attempts: [] };
+  if (!Array.isArray(entries)) return null;
   for (const entry of entries) {
-    const raw = JSON.stringify(entry?.message?.content ?? entry?.content ?? entry?.data ?? "");
-    if (PR_URL_RE.test(raw)) return true;
+    if (entry.type !== "custom" || entry.customType !== STATE_TYPE) continue;
+    const data = entry.data;
+    // Forked/copied records must not grant authority in a different session.
+    if (typeof data?.sessionId === "string" && UUID.test(data.sessionId) && data.sessionId !== id) continue;
+    if (data?.version !== 1 || data.sessionId !== id || typeof data.paused !== "boolean" ||
+        !Array.isArray(data.attempts) || data.attempts.some(key => typeof key !== "string" || key.length === 0) ||
+        new Set(data.attempts).size !== data.attempts.length) return null;
+    state = { ...data, attempts: [...data.attempts] };
   }
-  return false;
+  return state;
 }
 
-function persistContract(pi, ctx) {
-  if (!isMuse(ctx)) return null;
-  const entries = branchEntries(ctx);
-  let when = "";
-  for (const entry of entries) {
-    const found = extractStopWhen(assistantText(entry));
-    if (found) when = found;
-  }
-  if (!when) return null;
-  const prev = latestContract(entries);
-  if (prev?.when === when) return prev;
-  try {
-    pi.appendEntry(CONTRACT_TYPE, { when, at: Date.now() });
-  } catch {
-    return { when, at: Date.now() };
-  }
-  return { when, at: Date.now() };
-}
-
-function latestOpenTodos(ctx) {
-  const entries = branchEntries(ctx);
+// Only explicit, structured snapshots on the CURRENT branch. Invalid latest
+// state is unknown, not permission to fall back to earlier unfinished work.
+function openTodos(entries) {
+  if (!Array.isArray(entries)) return null;
   let tasks = [];
   for (const entry of entries) {
-    if (entry?.type === "custom" && entry.customType === TODO_STATE_TYPE) {
-      const phases = readPhases(entry.data);
-      if (phases) tasks = phases.flatMap((phase) => phase.tasks ?? []);
+    let payload;
+    if (entry.type === "custom" && entry.customType === TODO_TYPE) payload = entry.data;
+    else if (entry.type === "message" && entry.message?.role === "toolResult" &&
+      ["todo", "todowrite"].includes(entry.message.toolName)) {
+      payload = entry.message.isError ? undefined : entry.message.details;
+    } else continue;
+    if (!payload || (payload.schema !== undefined && payload.schema !== "v2")) {
+      tasks = null;
       continue;
     }
-    const message = entry?.type === "message" ? entry.message : entry;
-    if (message?.role !== "toolResult") continue;
-    if (message.toolName !== "todo" && message.toolName !== "todowrite") continue;
-    const phases = readPhases(message.details);
-    if (phases) tasks = phases.flatMap((phase) => phase.tasks ?? []);
+    if (Array.isArray(payload.phases)) {
+      tasks = payload.phases.every(phase => typeof phase?.name === "string" && Array.isArray(phase.tasks))
+        ? payload.phases.flatMap(phase => phase.tasks) : null;
+    } else tasks = payload.schema === undefined && Array.isArray(payload.todos) ? payload.todos : null;
+    if (tasks?.some(task => typeof task?.content !== "string" || !task.content.trim() || !STATUSES.has(task.status))) tasks = null;
   }
-  return tasks
-    .filter((task) => task && OPEN_TODO.has(task.status) && typeof task.content === "string")
-    .map((task) => task.content);
+  return tasks?.filter(task => task.status === "pending" || task.status === "in_progress") ?? null;
 }
 
-function unfinishedWork(ctx) {
-  const open = latestOpenTodos(ctx);
-  if (open.length > 0) return { kind: "todos", open };
-  const entries = branchEntries(ctx);
-  const contract = latestContract(entries);
-  if (!contract?.when) return null;
-  if (USER_WAIT_RE.test(contract.when)) return null;
-  if (NEEDS_PR_RE.test(contract.when.replace(NO_PR_RE, "")) && !transcriptHasPull(entries)) {
-    return { kind: "contract", open: [`I'll stop when ${contract.when}`] };
-  }
-  return null;
-}
-
-function lastAssistantStopReason(event) {
-  const messages = Array.isArray(event?.messages) ? event.messages : [];
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "assistant") return messages[i].stopReason;
-  }
-  return undefined;
-}
-
-function prematurePrompt(work) {
-  const open = work.open;
-  const listed = open
-    .slice(0, 8)
-    .map((item) => `- ${item}`)
-    .join("\n");
-  const extra = open.length > 8 ? `\n- …and ${open.length - 8} more` : "";
-  const head =
-    work.kind === "contract"
-      ? "You ended the turn before your declared stop-when contract held. That is a premature stop."
-      : "You ended the turn while todo work is still open. That is a premature stop.";
-  return [
-    head,
-    "Continue the same task now. Do not wait for the user. Do not restart from scratch.",
-    work.kind === "contract" ? "Unmet contract:" : "Open todos:",
-    listed + extra,
-  ].join("\n");
-}
-
-export default function (pi) {
-  if (!enabled()) return;
-
-  let lastActivity = Date.now();
-  let lastStallTrip = 0;
-  let lastPrematureTrip = 0;
-  let stallTrips = 0;
-  let prematureTrips = 0;
-  let pending = false;
-  let userAborted = false;
-  let retrying = false;
-  const activeTools = new Set();
-  let lastTodoSig = "";
-  let lastSkip = "";
+export default function museWatch(pi) {
+  if (["0", "false", "off", "no"].includes(process.env.OMO_MUSE_WATCH?.toLowerCase())) return;
+  const owners = globalThis[OWNERS] ??= new Map();
+  const stallMs = stallDuration();
+  const wakes = new Map();
+  const holds = new Map();
+  const inputs = new Map();
+  const tools = new Set();
+  let pauseGeneration = 0;
   let liveCtx;
-  let stallTimer;
-  let kickTimer;
+  let id;
+  let state;
+  let valid = false;
+  let active = false;
+  let disposed = false;
+  let timer;
+  let retrying = false;
+  let lastActivity = Date.now();
+  let warned = false;
+  let warningCount = 0;
+  let lastReason = "not-started";
+  const owner = { stop, command: handleCommand };
 
-  const bump = (_event, ctx) => {
-    lastActivity = Date.now();
-    if (ctx) liveCtx = ctx;
-  };
-
-  function stopTimers() {
-    clearScheduled(stallTimer);
-    clearScheduled(kickTimer);
-    stallTimer = undefined;
-    kickTimer = undefined;
+  function stop() {
+    clearInterval(timer);
+    timer = undefined;
+    if (id && owners.get(id) === owner) owners.delete(id);
+    active = false;
+    liveCtx = undefined;
+    inputs.clear();
+    tools.clear();
   }
 
-  function pauseForUser() {
-    userAborted = true;
-    clearScheduled(kickTimer);
-    kickTimer = undefined;
-    pending = false;
-  }
-
-  function canSend(ctx) {
-    return !userAborted && !retrying && isMuse(ctx) && !ctx.hasPendingMessages?.();
-  }
-
-  function kickPremature(ctx, label) {
-    lastSkip = "";
-    if (!ctx) {
-      lastSkip = "no-ctx";
-      return false;
-    }
-    if (pending) {
-      lastSkip = "pending";
-      return false;
-    }
-    if (userAborted || retrying) {
-      lastSkip = userAborted ? "user-abort" : "retrying";
-      return false;
-    }
-    if (!isMuse(ctx)) {
-      lastSkip = `not-muse:${modelBlob(ctx) || "none"}`;
-      return false;
-    }
-    if (typeof ctx.hasPendingMessages === "function" && ctx.hasPendingMessages()) {
-      lastSkip = "queued";
-      return false;
-    }
-    if (prematureTrips >= MAX_PREMATURE_TRIPS) {
-      lastSkip = "max-trips";
-      return false;
-    }
-    if (Date.now() - lastPrematureTrip < COOLDOWN_MS && prematureTrips > 0) {
-      lastSkip = "cooldown";
-      return false;
-    }
-
-    persistContract(pi, ctx);
-    const work = unfinishedWork(ctx);
-    if (!work) {
-      lastSkip = "no-unfinished";
-      return false;
-    }
-
-    lastTodoSig = work.open.join("\n");
-    lastPrematureTrip = Date.now();
-    prematureTrips += 1;
-    pending = true;
-    const toast = `muse ${label} ${work.kind} x${work.open.length} — continue ${prematureTrips}/${MAX_PREMATURE_TRIPS}`;
-    notify(ctx, toast, "warning");
-    setWatchStatus(ctx, toast);
-
-    const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
-    const send = () => {
-      kickTimer = undefined;
-      pending = false;
-      try {
-        if (!canSend(ctx)) return;
-        const currentWork = unfinishedWork(ctx);
-        if (!currentWork) return;
-        const result = (ctx.isIdle?.() ?? true)
-          ? pi.sendUserMessage(prematurePrompt(currentWork))
-          : pi.sendUserMessage(prematurePrompt(currentWork), { deliverAs: "followUp" });
-        if (result && typeof result.then === "function") {
-          result.catch((error) => {
-            lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
-            notify(ctx, `muse-watch send failed: ${lastSkip}`, "error");
-            setWatchStatus(ctx, `send-fail ${lastSkip}`);
-            pending = false;
-          });
-        }
-      } catch (error) {
-        lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
-        notify(ctx, `muse-watch send failed: ${lastSkip}`, "error");
-        setWatchStatus(ctx, `send-fail ${lastSkip}`);
-        pending = false;
+  function guarded(ctx, fn) {
+    if (!active || disposed) return;
+    try {
+      if (sessionId(ctx) !== id || (id && owners.get(id) !== owner)) {
+        stop();
         return;
       }
-      lastActivity = Date.now();
-      pending = false;
-    };
-    kickTimer = scheduleTimeout(ctx, send, idle ? 0 : 400);
-    return true;
-  }
-
-  function tick(ctx) {
-    if (!ctx || pending || userAborted || retrying || activeTools.size > 0) return;
-    if (!isMuse(ctx)) return;
-
-    const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
-    if (idle) {
-      if (Date.now() - lastActivity < IDLE_TODO_MS) return;
-      kickPremature(ctx, "idle");
-      return;
-    }
-
-    if (stallTrips >= MAX_STALL_TRIPS) return;
-    const silent = Date.now() - lastActivity;
-    if (silent < STALL_MS) return;
-    if (stallTrips > 0 && Date.now() - lastStallTrip < COOLDOWN_MS) return;
-
-    pending = true;
-    lastStallTrip = Date.now();
-    stallTrips += 1;
-    notify(
-      ctx,
-      `muse stalled ${Math.round(silent / 1000)}s — abort ${stallTrips}/${MAX_STALL_TRIPS}`,
-      "warning",
-    );
-
-    try {
-      ctx.abort?.("system");
+      liveCtx = ctx;
+      fn();
     } catch (error) {
-      pending = false;
-      if (isStaleCtxError(error)) stopTimers();
-      return;
+      stop();
+      if (!(error instanceof Error && error.message.startsWith(STALE_PREFIX))) {
+        console.error("muse-watch context failure; recovery disabled", error);
+      }
     }
-
-    kickTimer = scheduleTimeout(
-      ctx,
-      () => {
-        kickTimer = undefined;
-        pending = false;
-        try {
-          if (!canSend(ctx)) return;
-          const result = pi.sendUserMessage(STALL_PROMPT, { deliverAs: "followUp" });
-          if (result && typeof result.then === "function") {
-            result.catch(() => {
-              pending = false;
-            });
-          }
-        } catch {
-          pending = false;
-          return;
-        }
-        lastActivity = Date.now();
-        pending = false;
-      },
-      1200,
-    );
   }
 
-  function ensureTicker(ctx) {
-    if (!ctx || stallTimer) return;
-    stallTimer = scheduleInterval(ctx, () => tick(liveCtx || ctx), TICK_MS);
+  function observe() {
+    const ctx = liveCtx;
+    const model = ctx.model;
+    const branch = ctx.sessionManager?.getBranch?.();
+    const todos = openTodos(branch);
+    const draftEmpty = ctx.mode === "tui" && typeof ctx.ui?.getEditorText === "function" && ctx.ui.getEditorText() === "";
+    return {
+      version: 1,
+      sessionId: id ?? null,
+      paused: state?.paused ?? true,
+      attempts: state?.attempts.length ?? 0,
+      model: model ? { provider: model.provider, id: model.id } : null,
+      supportedModel: !!model && SUPPORTED_MODELS.has(`${model.provider}/${model.id}`),
+      draftKnownEmpty: draftEmpty,
+      idle: ctx.isIdle?.() === true,
+      nativeQueueEmpty: ctx.hasPendingMessages?.() === false,
+      notCompacting: ctx.isCompacting?.() === false,
+      backgroundActive: [...wakes.values()].some(count => count > 0) || [...holds.values()].some(Boolean),
+      wakeSources: Object.fromEntries(wakes),
+      completionDelivery: "unknown",
+      automaticContinuation: "blocked-pending-delivery-visibility",
+      automaticAbort: false,
+      openTodos: todos === null ? null : todos.length,
+      stalled: false,
+    };
   }
 
-  pi.on("message_update", bump);
-  pi.on("message_start", bump);
-  pi.on("after_provider_response", bump);
-  pi.on("tool_execution_start", (event, ctx) => {
-    activeTools.add(event.toolCallId);
-    bump(event, ctx);
-  });
-  pi.on("tool_execution_update", bump);
-  pi.on("tool_execution_end", (event, ctx) => {
-    activeTools.delete(event.toolCallId);
-    bump(event, ctx);
-  });
-  pi.on("agent_start", (event, ctx) => {
-    userAborted = false;
-    retrying = false;
-    bump(event, ctx);
-  });
-  pi.on("agent_settled", (event, ctx) => {
-    retrying = false;
-    bump(event, ctx);
-  });
-  pi.on("session_abort", pauseForUser);
-  pi.on("turn_start", bump);
-  pi.on("message_end", (event, ctx) => {
-    bump(event, ctx);
-    if (event?.message?.role !== "assistant") return;
-    persistContract(pi, ctx);
-  });
+  function publish(reason = lastReason, snapshot = observe()) {
+    lastReason = reason;
+    const data = { ...snapshot, reason };
+    pi.events.emit("muse_watch_state", data);
+    // Real Senpi RPC extension events; useful to read-only diagnostics clients.
+    pi.rpc?.emit("muse_watch_state", data);
+    liveCtx.ui?.setStatus?.("muse-watch", `${reason}; open=${data.openTodos ?? "unknown"}; auto=blocked`);
+    return data;
+  }
 
-  pi.on("session_shutdown", () => {
-    stopTimers();
-    liveCtx = undefined;
-    pending = false;
-  });
+  function notify(message, kind = "info") {
+    if (liveCtx.hasUI) liveCtx.ui.notify(message, kind);
+  }
+
+  function persist(next) {
+    // Keep the local restriction even if append fails after a partial write.
+    state = next;
+    try {
+      pi.appendEntry(STATE_TYPE, state);
+      return true;
+    } catch (error) {
+      valid = false;
+      console.error("muse-watch persistence failed; recovery disabled", error);
+      publish("persistence-failed");
+      notify("muse-watch could not persist state. No continuation will be sent.", "error");
+      return false;
+    }
+  }
+
+  function setPaused(paused) {
+    // Older inputs cannot undo a newer pause, but remain admission holds
+    // until their dispositions arrive. Resume must not erase those holds.
+    if (paused) pauseGeneration += 1;
+    if (!id) return publish("invalid-session");
+    if (!valid) return publish("invalid-state");
+    if (persist({ ...state, paused })) publish(paused ? "paused" : "observing-only");
+  }
+
+  function activity() {
+    lastActivity = Date.now();
+    warned = false;
+  }
+
+  function veto(snapshot) {
+    if (!id) return "invalid-session";
+    if (!valid) return "invalid-state";
+    if (state.paused) return "paused";
+    if (!snapshot.supportedModel) return "unsupported-model";
+    if (!snapshot.draftKnownEmpty) return "draft-not-known-empty";
+    if (!snapshot.nativeQueueEmpty) return "queued-messages";
+    if (!snapshot.notCompacting) return "compacting-or-unknown";
+    if (inputs.size) return "input-pending";
+    if (snapshot.backgroundActive) return "background-active";
+    if (retrying || tools.size) return "agent-busy";
+  }
+
+  function tick() {
+    const snapshot = observe();
+    if (veto(snapshot) || snapshot.idle || Date.now() - lastActivity < stallMs) return;
+    publish("stall-observed", { ...snapshot, stalled: true });
+    if (!warned && warningCount < MAX_STALL_WARNINGS) {
+      warned = true;
+      warningCount += 1;
+      notify("Muse has no recent stream/tool activity. No automatic abort or resend: pending completion delivery is unknown. Inspect the run; use Escape to stop it yourself.", "warning");
+    }
+  }
+
+  // Bus subscriptions are installed before session_start. A zero only removes
+  // that source's positive veto: it NEVER proves pending delivery is empty.
+  const unsubscribers = [
+    pi.events.on("wake_source_state", data => {
+      if (disposed || typeof data?.source !== "string" || !data.source ||
+          !Number.isSafeInteger(data.activeCount) || data.activeCount < 0) return;
+      wakes.set(data.source, data.activeCount);
+    }),
+    pi.events.on("continuation_hold_state", data => {
+      if (!disposed && typeof data?.source === "string" && typeof data.active === "boolean") holds.set(data.source, data.active);
+    }),
+    pi.events.on("goal_continuation_timer_state", data => {
+      if (!disposed && typeof data?.armed === "boolean") holds.set("goal-timer", data.armed);
+    }),
+  ];
 
   pi.on("session_start", (_event, ctx) => {
-    liveCtx = ctx;
-    lastActivity = Date.now();
-    lastStallTrip = 0;
-    lastPrematureTrip = 0;
-    stallTrips = 0;
-    prematureTrips = 0;
-    pending = false;
-    userAborted = false;
-    retrying = false;
-    activeTools.clear();
-    lastTodoSig = "";
-    lastSkip = "";
-    stopTimers();
-    persistContract(pi, ctx);
-    const work = unfinishedWork(ctx);
-    const blob = modelBlob(ctx) || "no-model";
-    setWatchStatus(
-      ctx,
-      `armed ${blob} todos=${latestOpenTodos(ctx).length} contract=${work?.kind === "contract" ? "unmet" : "none"}`,
-    );
-    ensureTicker(ctx);
-    const kicked = kickPremature(ctx, "resume");
-    if (kicked) return;
-    if (!work) return;
-    const skipText = `resume skipped (${lastSkip}) ${work.kind}`;
-    setWatchStatus(ctx, skipText);
-    notify(ctx, `muse-watch ${skipText}`, "warning");
-  });
-
-  pi.registerCommand?.("muse-watch", {
-    description: "Show muse-watch model/todo status",
-    handler: (_args, ctx) => {
+    if (disposed) return;
+    stop();
+    try {
+      id = sessionId(ctx);
+      if (id) owners.get(id)?.stop();
+      if (id) owners.set(id, owner);
       liveCtx = ctx;
-      persistContract(pi, ctx);
-      const work = unfinishedWork(ctx);
-      const text = `model=${modelBlob(ctx) || "none"} muse=${isMuse(ctx)} idle=${ctx.isIdle?.()} unfinished=${work ? work.kind : "none"} skip=${lastSkip || "-"} trips=${prematureTrips}`;
-      setWatchStatus(ctx, text);
-      notify(ctx, text, "info");
-    },
+      active = true;
+      state = id ? readState(ctx.sessionManager.getEntries(), id) : null;
+      valid = state !== null;
+      retrying = false;
+      activity();
+      warningCount = 0;
+      publish(!id ? "invalid-session" : !valid ? "invalid-state" : state.paused ? "paused" : "observing-only");
+      if (id && valid) timer = setInterval(() => guarded(liveCtx, tick), TICK_MS);
+    } catch (error) {
+      stop();
+      console.error("muse-watch initialization failed; recovery disabled", error);
+    }
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    liveCtx = ctx;
-    activeTools.clear();
-    ensureTicker(ctx);
-    retrying = event?.willRetry === true;
-    if (event?.aborted === true && event.abortSource === "user") {
-      pauseForUser();
+  // Before-switch/fork events are cancellable and may precede validation.
+  // Retire only on shutdown, a new session_start, or an observed identity change.
+  pi.on("session_shutdown", () => {
+    disposed = true;
+    stop();
+    for (const unsubscribe of unsubscribers) unsubscribe();
+  });
+
+  for (const event of ["message_start", "message_update", "message_end", "after_provider_response", "tool_execution_update", "turn_start", "model_select"]) {
+    pi.on(event, (_event, ctx) => guarded(ctx, activity));
+  }
+  pi.on("tool_execution_start", (event, ctx) => guarded(ctx, () => { tools.add(event.toolCallId); activity(); }));
+  pi.on("tool_execution_end", (event, ctx) => guarded(ctx, () => { tools.delete(event.toolCallId); activity(); }));
+  pi.on("agent_start", (_event, ctx) => guarded(ctx, () => {
+    // Disposition handlers finish before _promptAgent marks the run active.
+    // Only this transition closes the accepted-input admission gap.
+    if (ctx.isIdle?.() === false) {
+      for (const [inputId, input] of inputs) {
+        if (["started", "queued"].includes(input.disposition)) inputs.delete(inputId);
+      }
+    }
+    retrying = false;
+    activity();
+  }));
+  pi.on("agent_settled", (_event, ctx) => guarded(ctx, () => { retrying = false; activity(); publish(); }));
+  pi.on("agent_end", (event, ctx) => guarded(ctx, () => {
+    retrying = event.willRetry === true;
+    if (event.aborted === true && event.abortSource === "user") setPaused(true);
+  }));
+  pi.on("session_abort", (_event, ctx) => guarded(ctx, () => setPaused(true)));
+  pi.on("input", (event, ctx) => guarded(ctx, () => {
+    if (["interactive", "rpc"].includes(event.source) && typeof event.inputId === "string") {
+      inputs.set(event.inputId, { generation: pauseGeneration, disposition: "pending" });
+    }
+  }));
+  pi.on("input_disposition", (event, ctx) => guarded(ctx, () => {
+    const input = inputs.get(event.inputId);
+    if (!input) return;
+    if (["handled", "rejected", "cancelled"].includes(event.disposition)) {
+      inputs.delete(event.inputId);
       return;
     }
-    if (retrying) return;
-    const reason = lastAssistantStopReason(event);
-    if (reason && reason !== "stop" && reason !== "length") return;
-    kickPremature(ctx, "stopped");
+    if (!["started", "queued"].includes(event.disposition)) return;
+    input.disposition = event.disposition;
+    if (event.disposition === "queued" && ctx.hasPendingMessages?.() === true) inputs.delete(event.inputId);
+    if (input.generation === pauseGeneration) {
+      // Pause acceptance and admission ownership are separate: a started input
+      // clears pause but retains its hold until agent_start or rejection.
+      if (id && valid && persist({ ...state, paused: false })) publish("observing-only");
+    }
+  }));
+
+  function handleCommand(args, ctx) {
+    return guarded(ctx, () => {
+      const command = args.trim() || "status";
+      if (command === "pause" || command === "resume") {
+        setPaused(command === "pause");
+        notify("muse-watch: pause state updated only if persisted; automatic abort/continuation remains disabled.");
+        return;
+      }
+      if (command === "status") { notify(JSON.stringify(publish())); return; }
+      if (!["continue", "continue-confirmed"].includes(command)) {
+        publish("unknown-command");
+        notify("Use /muse-watch status, pause, resume, continue, or continue-confirmed.");
+        return;
+      }
+      const snapshot = observe();
+      const blocked = veto(snapshot) ?? (!snapshot.idle ? "agent-busy" :
+        snapshot.openTodos === null ? "invalid-todos" : snapshot.openTodos === 0 ? "no-open-todos" : undefined);
+      if (blocked) {
+        publish(blocked, snapshot);
+        notify(`Manual continuation blocked: ${blocked}. Resume only clears pause; it does not prove background delivery is empty.`, "warning");
+        return;
+      }
+      if (command === "continue") {
+        publish("confirmation-required", snapshot);
+        notify("Pending completion delivery is UNKNOWN, even with zero live wake sources. /muse-watch continue-confirmed explicitly requests one manual continuation despite that uncertainty. Known queued messages, live background work, pause and drafts still block it. No automatic continuation is enabled.", "warning");
+        return;
+      }
+      const file = ctx.sessionManager.getSessionFile?.();
+      const entries = ctx.sessionManager.getEntries();
+      // Senpi defers the initial JSONL flush until an assistant entry exists.
+      if (typeof file !== "string" || !isAbsolute(file) || !entries.some(entry => entry.type === "message" && entry.message?.role === "assistant")) {
+        publish("non-durable-session", snapshot);
+        notify("No manual continuation: this session cannot durably record an attempt yet.", "warning");
+        return;
+      }
+      const branch = ctx.sessionManager.getBranch();
+      const admissionKey = branch.findLast(entry => entry.type === "message" && entry.message?.role === "user")?.id;
+      if (typeof admissionKey !== "string" || !admissionKey) { publish("no-user-turn", snapshot); return; }
+      if (state.attempts.includes(admissionKey)) {
+        publish("attempt-already-claimed", snapshot);
+        notify("A continuation was already attempted for this user turn. Its delivery may be unknown; it will not be retried. Send a new instruction yourself if needed.", "warning");
+        return;
+      }
+      if (!persist({ ...state, attempts: [...state.attempts, admissionKey] })) return;
+      // No await between validation, claim, and invocation. Custom messages do
+      // not create a new user admission. A void return is NOT a delivery receipt.
+      try {
+        pi.sendMessage({
+          customType: "muse-watch.continue",
+          content: "The user explicitly requested a manual continuation. Reassess the current task and its explicit open todos, account for any background results, and continue without restarting completed work. Respect blockers and requests for user input.",
+          display: true,
+          details: { sessionId: id, admissionKey },
+        }, { triggerTurn: true, deliverAs: "followUp" });
+        publish("manual-attempt-claimed");
+        notify("One manual continuation was claimed and submitted; delivery is not acknowledged. Automatic recovery remains disabled.");
+      } catch (error) {
+        console.error("muse-watch send outcome unknown; claim retained", error);
+        publish("send-outcome-unknown");
+        notify("Continuation delivery is unknown. The attempt remains claimed and will not be retried.", "error");
+      }
+    });
+  }
+
+  pi.registerCommand("muse-watch", {
+    description: "Status/pause/resume; continue explains manual recovery, continue-confirmed acknowledges unknown completion delivery.",
+    handler: (args, ctx) => {
+      if (disposed) return;
+      try {
+        // Senpi retains duplicate commands as :1/:2. Every alias must invoke
+        // the live owner's state and pi, never revive its own stopped instance.
+        const currentId = sessionId(ctx);
+        const currentOwner = currentId ? owners.get(currentId) : owner;
+        currentOwner?.command(args, ctx);
+      } catch (error) {
+        if (!(error instanceof Error && error.message.startsWith(STALE_PREFIX))) {
+          console.error("muse-watch command routing failed; no action taken", error);
+        }
+      }
+    },
   });
 }
