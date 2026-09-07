@@ -58,6 +58,13 @@ CONTRACT_CONTINUE = (
 STOP_WHEN_RE = re.compile(r"I(?:['’]ll| will) stop when\s+(.+?)(?:\.|$)", re.I)
 PR_URL_RE = re.compile(r"github\.com/[^\s)\]>'\"]+/pull/\d+", re.I)
 NEEDS_PR_RE = re.compile(r"\bpr\b|pull request|pr url", re.I)
+NO_PR_RE = re.compile(
+    r"\b(?:no|without|not|never|do not|don['’]t)\s+"
+    r"(?:(?:open(?:ing)?|creat(?:e|ing)|rais(?:e|ing)|submit(?:ting)?)\s+)?"
+    r"(?:(?:a|an|the|any|another)\s+)?(?:pr(?:\s+url)?|pull request)\b"
+    r"|\b(?:pr(?:\s+url)?|pull request)\s+(?:is\s+)?(?:not\s+(?:needed|required)|unnecessary)\b",
+    re.I,
+)
 USER_WAIT_RE = re.compile(
     r"\b(you confirm|your answer|the user|user replies|you say|wait for (?:the )?user)\b",
     re.I,
@@ -94,16 +101,20 @@ def herdr(*args: str) -> str:
     env = os.environ.copy()
     extra = str(Path.home() / ".local" / "bin")
     env["PATH"] = extra + os.pathsep + env.get("PATH", "")
-    completed = subprocess.run(
-        [HERDR, *args],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-        **hidden_run_kwargs(),
-    )
+    try:
+        completed = subprocess.run(
+            [HERDR, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=10,
+            **hidden_run_kwargs(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"herdr {' '.join(args[:2])} timed out after {error.timeout}s") from error
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or f"herdr {' '.join(args)} failed")
     return completed.stdout
@@ -130,29 +141,48 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_PATH)
 
 
-def session_jsonl_for_cwd(cwd: str) -> Path | None:
-    if not SESSIONS_DIR.is_dir() or not cwd:
+def session_jsonl_for_cwd(cwd: str, agent_session: dict | None = None) -> Path | None:
+    """Prefer Herdr's exact identity; never guess by basename or recency."""
+    session_id = ""
+    if agent_session is not None:
+        if not isinstance(agent_session, dict) or agent_session.get("agent") != "omo":
+            return None
+        kind, value = agent_session.get("kind"), agent_session.get("value")
+        if not isinstance(value, str) or not value:
+            return None
+        if kind == "path":
+            path = Path(value)
+            return path if path.is_absolute() and path.is_file() else None
+        if kind != "id":
+            return None
+        session_id = value
+    if not SESSIONS_DIR.is_dir() or not (cwd or session_id):
         return None
     needle = cwd.replace("\\", "-").replace("/", "-").replace(":", "")
-    hits: list[tuple[float, Path]] = []
+    hits: list[Path] = []
     for folder in SESSIONS_DIR.iterdir():
-        if not folder.is_dir():
-            continue
-        if needle not in folder.name and Path(cwd).name not in folder.name:
+        if not folder.is_dir() or (not session_id and needle not in folder.name):
             continue
         for jsonl in folder.glob("*.jsonl"):
-            try:
-                hits.append((jsonl.stat().st_mtime, jsonl))
-            except OSError:
+            if session_id and not jsonl.name.endswith(f"_{session_id}.jsonl"):
                 continue
-    if not hits:
-        return None
-    hits.sort(reverse=True)
-    return hits[0][1]
+            try:
+                with jsonl.open(encoding="utf-8") as fh:
+                    header = json.loads(fh.readline())
+            except (OSError, ValueError) as error:
+                log(f"skip session {jsonl}: {error}")
+                return None
+            if not isinstance(header, dict) or header.get("type") != "session":
+                return None
+            if (header.get("id") == session_id if session_id else header.get("cwd") == cwd):
+                hits.append(jsonl)
+                if len(hits) > 1:
+                    return None
+    return hits[0] if hits else None
 
 
-def unfinished_from_jsonl(cwd: str) -> tuple[str, list[str]]:
-    path = session_jsonl_for_cwd(cwd)
+def unfinished_from_jsonl(cwd: str, agent_session: dict | None = None) -> tuple[str, list[str]]:
+    path = session_jsonl_for_cwd(cwd, agent_session)
     if path is None:
         return ("", [])
     when = ""
@@ -191,7 +221,7 @@ def unfinished_from_jsonl(cwd: str) -> tuple[str, list[str]]:
         return ("", [])
     if not when or USER_WAIT_RE.search(when):
         return ("", [])
-    if NEEDS_PR_RE.search(when) and not has_pull:
+    if NEEDS_PR_RE.search(NO_PR_RE.sub("", when)) and not has_pull:
         return ("contract", [f"I'll stop when {when}"])
     return ("", [])
 
@@ -279,7 +309,7 @@ def tick(state: dict) -> dict:
         kind = "todos"
         items = open_todos
         if not items:
-            kind, items = unfinished_from_jsonl(str(agent.get("cwd") or ""))
+            kind, items = unfinished_from_jsonl(str(agent.get("cwd") or ""), agent.get("agent_session"))
         if not items:
             continue
         sig = kind + "\n" + "\n".join(items)
@@ -360,7 +390,7 @@ def main() -> int:
                 log(f"dry {pane_id} read: {error}")
                 continue
             open_todos = parse_open_todos(text)
-            kind, contract_items = unfinished_from_jsonl(str(agent.get("cwd") or ""))
+            kind, contract_items = unfinished_from_jsonl(str(agent.get("cwd") or ""), agent.get("agent_session"))
             muse = bool(MUSE_RE.search(text))
             skip = should_skip_prompt(text)
             log(

@@ -25,6 +25,8 @@ const OPEN_TODO = new Set(["pending", "in_progress"]);
 const STOP_WHEN_RE = /I(?:['’]ll| will) stop when\s+(.+?)(?:\.|$)/i;
 const PR_URL_RE = /github\.com\/[^\s)\]>'"]+\/pull\/\d+/i;
 const NEEDS_PR_RE = /\bpr\b|pull request|pr url/i;
+const NO_PR_RE =
+  /\b(?:no|without|not|never|do not|don['’]t)\s+(?:(?:open(?:ing)?|creat(?:e|ing)|rais(?:e|ing)|submit(?:ting)?)\s+)?(?:(?:a|an|the|any|another)\s+)?(?:pr(?:\s+url)?|pull request)\b|\b(?:pr(?:\s+url)?|pull request)\s+(?:is\s+)?(?:not\s+(?:needed|required)|unnecessary)\b/gi;
 const USER_WAIT_RE =
   /\b(you confirm|your answer|the user|user replies|you say|wait for (?:the )?user)\b/i;
 const STALL_MS = parseDurationEnv("OMO_MUSE_STALL_MS", 40_000);
@@ -79,10 +81,7 @@ function modelBlob(ctx) {
 }
 
 function isMuse(ctx) {
-  const blob = modelBlob(ctx);
-  if (blob) return MUSE_RE.test(blob);
-  // Unknown model + open todos is the wish-5 /reload case: do not skip.
-  return true;
+  return MUSE_RE.test(modelBlob(ctx));
 }
 
 function isStaleCtxError(error) {
@@ -196,6 +195,7 @@ function transcriptHasPull(entries) {
 }
 
 function persistContract(pi, ctx) {
+  if (!isMuse(ctx)) return null;
   const entries = branchEntries(ctx);
   let when = "";
   for (const entry of entries) {
@@ -240,7 +240,7 @@ function unfinishedWork(ctx) {
   const contract = latestContract(entries);
   if (!contract?.when) return null;
   if (USER_WAIT_RE.test(contract.when)) return null;
-  if (NEEDS_PR_RE.test(contract.when) && !transcriptHasPull(entries)) {
+  if (NEEDS_PR_RE.test(contract.when.replace(NO_PR_RE, "")) && !transcriptHasPull(entries)) {
     return { kind: "contract", open: [`I'll stop when ${contract.when}`] };
   }
   return null;
@@ -276,14 +276,15 @@ function prematurePrompt(work) {
 export default function (pi) {
   if (!enabled()) return;
 
-  pi.setLabel?.("muse-watch");
-
   let lastActivity = Date.now();
   let lastStallTrip = 0;
   let lastPrematureTrip = 0;
   let stallTrips = 0;
   let prematureTrips = 0;
   let pending = false;
+  let userAborted = false;
+  let retrying = false;
+  const activeTools = new Set();
   let lastTodoSig = "";
   let lastSkip = "";
   let liveCtx;
@@ -302,6 +303,17 @@ export default function (pi) {
     kickTimer = undefined;
   }
 
+  function pauseForUser() {
+    userAborted = true;
+    clearScheduled(kickTimer);
+    kickTimer = undefined;
+    pending = false;
+  }
+
+  function canSend(ctx) {
+    return !userAborted && !retrying && isMuse(ctx) && !ctx.hasPendingMessages?.();
+  }
+
   function kickPremature(ctx, label) {
     lastSkip = "";
     if (!ctx) {
@@ -310,6 +322,10 @@ export default function (pi) {
     }
     if (pending) {
       lastSkip = "pending";
+      return false;
+    }
+    if (userAborted || retrying) {
+      lastSkip = userAborted ? "user-abort" : "retrying";
       return false;
     }
     if (!isMuse(ctx)) {
@@ -346,10 +362,15 @@ export default function (pi) {
 
     const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
     const send = () => {
+      kickTimer = undefined;
+      pending = false;
       try {
-        const result = idle
-          ? pi.sendUserMessage(prematurePrompt(work))
-          : pi.sendUserMessage(prematurePrompt(work), { deliverAs: "followUp" });
+        if (!canSend(ctx)) return;
+        const currentWork = unfinishedWork(ctx);
+        if (!currentWork) return;
+        const result = (ctx.isIdle?.() ?? true)
+          ? pi.sendUserMessage(prematurePrompt(currentWork))
+          : pi.sendUserMessage(prematurePrompt(currentWork), { deliverAs: "followUp" });
         if (result && typeof result.then === "function") {
           result.catch((error) => {
             lastSkip = `send:${error instanceof Error ? error.message : String(error)}`;
@@ -373,7 +394,7 @@ export default function (pi) {
   }
 
   function tick(ctx) {
-    if (!ctx || pending) return;
+    if (!ctx || pending || userAborted || retrying || activeTools.size > 0) return;
     if (!isMuse(ctx)) return;
 
     const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() : false;
@@ -386,7 +407,7 @@ export default function (pi) {
     if (stallTrips >= MAX_STALL_TRIPS) return;
     const silent = Date.now() - lastActivity;
     if (silent < STALL_MS) return;
-    if (Date.now() - lastStallTrip < COOLDOWN_MS) return;
+    if (stallTrips > 0 && Date.now() - lastStallTrip < COOLDOWN_MS) return;
 
     pending = true;
     lastStallTrip = Date.now();
@@ -398,7 +419,7 @@ export default function (pi) {
     );
 
     try {
-      ctx.abort?.();
+      ctx.abort?.("system");
     } catch (error) {
       pending = false;
       if (isStaleCtxError(error)) stopTimers();
@@ -408,7 +429,10 @@ export default function (pi) {
     kickTimer = scheduleTimeout(
       ctx,
       () => {
+        kickTimer = undefined;
+        pending = false;
         try {
+          if (!canSend(ctx)) return;
           const result = pi.sendUserMessage(STALL_PROMPT, { deliverAs: "followUp" });
           if (result && typeof result.then === "function") {
             result.catch(() => {
@@ -433,16 +457,26 @@ export default function (pi) {
 
   pi.on("message_update", bump);
   pi.on("message_start", bump);
-  pi.on("after_provider_response", (_event, ctx) => {
-    bump(_event, ctx);
-    stallTrips = 0;
+  pi.on("after_provider_response", bump);
+  pi.on("tool_execution_start", (event, ctx) => {
+    activeTools.add(event.toolCallId);
+    bump(event, ctx);
   });
-  pi.on("auto_retry_start", bump);
-  pi.on("auto_retry_end", bump);
-  pi.on("tool_execution_start", bump);
   pi.on("tool_execution_update", bump);
-  pi.on("tool_execution_end", bump);
-  pi.on("agent_start", bump);
+  pi.on("tool_execution_end", (event, ctx) => {
+    activeTools.delete(event.toolCallId);
+    bump(event, ctx);
+  });
+  pi.on("agent_start", (event, ctx) => {
+    userAborted = false;
+    retrying = false;
+    bump(event, ctx);
+  });
+  pi.on("agent_settled", (event, ctx) => {
+    retrying = false;
+    bump(event, ctx);
+  });
+  pi.on("session_abort", pauseForUser);
   pi.on("turn_start", bump);
   pi.on("message_end", (event, ctx) => {
     bump(event, ctx);
@@ -464,6 +498,9 @@ export default function (pi) {
     stallTrips = 0;
     prematureTrips = 0;
     pending = false;
+    userAborted = false;
+    retrying = false;
+    activeTools.clear();
     lastTodoSig = "";
     lastSkip = "";
     stopTimers();
@@ -497,9 +534,14 @@ export default function (pi) {
 
   pi.on("agent_end", (event, ctx) => {
     liveCtx = ctx;
+    activeTools.clear();
     ensureTicker(ctx);
-    if (event?.willRetry === true) return;
-    if (event?.aborted === true && event.abortSource === "user") return;
+    retrying = event?.willRetry === true;
+    if (event?.aborted === true && event.abortSource === "user") {
+      pauseForUser();
+      return;
+    }
+    if (retrying) return;
     const reason = lastAssistantStopReason(event);
     if (reason && reason !== "stop" && reason !== "length") return;
     kickPremature(ctx, "stopped");
