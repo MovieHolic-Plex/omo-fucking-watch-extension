@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  classifyAssistantStop,
+  INSPECTOR,
+  parseInspectVerdict,
+  buildInspectCommand,
+  buildInspectPrompt,
+  needsPrintInspect,
+} from "../muse-watch.js";
 
 const SID = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
@@ -43,6 +51,16 @@ async function harness(t, options = {}) {
     process.env[key] = value;
     t.after(() => previous === undefined ? delete process.env[key] : (process.env[key] = previous));
   }
+  const previousInspector = globalThis[INSPECTOR];
+  const inspections = [];
+  globalThis[INSPECTOR] = payload => {
+    inspections.push(payload);
+    return options.inspect ? options.inspect(payload, inspections) : (payload.regexKind === "premature" ? "premature" : "complete");
+  };
+  t.after(() => {
+    if (previousInspector === undefined) delete globalThis[INSPECTOR];
+    else globalThis[INSPECTOR] = previousInspector;
+  });
   const { default: extension } = await import(`../muse-watch.js?test=${++moduleId}`);
   const handlers = new Map();
   const commands = new Map();
@@ -136,7 +154,7 @@ async function harness(t, options = {}) {
   extension(pi);
   t.after(() => { state.stale = false; return emit("session_shutdown", { reason: "quit" }); });
   return {
-    clock, state, ctx, pi, sent, aborts, notifications, entries, emit, command, todos, bus,
+    clock, state, ctx, pi, sent, aborts, notifications, entries, emit, command, todos, bus, inspections,
     snapshot: () => snapshots.at(-1),
     install: () => extension(pi),
     async start() { await emit("session_start", { reason: "resume" }); },
@@ -165,14 +183,14 @@ test("registration uses no runtime actions before session_start", async t => {
   assert.equal(h.clock.timers.size, 0);
 });
 
-test("idle, resume, agent_end, and settled never auto-send despite open todos", async t => {
+test("idle, resume, empty agent_end, and settled never auto-send despite open todos", async t => {
   const h = await harness(t);
   await h.ready();
   await h.emit("agent_end", { messages: [] });
   await h.emit("agent_settled");
   await h.clock.advance(600_000);
   noAutomaticActions(h);
-  assert.equal(h.snapshot().automaticContinuation, "blocked-pending-delivery-visibility");
+  assert.equal(h.snapshot().automaticContinuation, "premature-stop-continue");
   assert.equal(h.snapshot().openTodos, 1);
 });
 
@@ -673,6 +691,174 @@ test("todo state uses only the current branch, latest full snapshot and legacy s
   await h.command("status"); assert.equal(h.snapshot().openTodos, 1);
   h.state.branch.push({ type: "custom", customType: "senpi.todo-state", data: { schema: "v2", phases: [] } });
   await h.command("continue-confirmed"); reason(h, "no-open-todos"); noAutomaticActions(h);
+});
+
+function assistant(text, extra = {}) {
+  return {
+    id: extra.id ?? "asst-stop",
+    role: "assistant",
+    stopReason: extra.stopReason ?? "stop",
+    content: extra.content ?? [{ type: "text", text }],
+  };
+}
+
+async function endTurn(h, message) {
+  await h.emit("agent_end", { messages: [message] });
+  await h.emit("agent_settled");
+}
+
+test("classifier marks production dangling Muse stops as premature", () => {
+  const cases = [
+    "RED 테스트 실행 중 (`bash_17` — gradle test). 완료 알림 오면 RED 캡처하고 구현 들어갑니다.",
+    "최종 빌드+테스트 실행 중 — 완료되면 결과 보고할게요.",
+    "Fixing the leftover broken `widerScope` reference in MapApp.",
+    "AccountSheet의 버튼성 Text들에 Role을 붙입니다.",
+    "구현 방향을 정리했습니다. 바로 코드를 작성합니다.",
+    "Build passes. The session image tool is key-blocked — so checking for a usable fallback before going procedural.",
+    "아직 설치용 앱(exe)은 없고 웹 빌드만 있는 상태입니다. 바로 실행할 수 있게 띄워드리겠습니다.",
+    "Phase 2 DAG가 출항했습니다 — 세 갑판이 조립되는 대로 검증하고 돌아오겠습니다.",
+  ];
+  for (const text of cases) {
+    assert.equal(classifyAssistantStop(assistant(text)).kind, "premature", text);
+  }
+});
+
+test("classifier leaves completed reports, I'll-stop-when, and user handoffs alone", () => {
+  const cases = [
+    "I'll stop when a PR URL exists.",
+    "이루다급 챗봇 업그레이드 완료. 6/6 todos, goal complete.",
+    "완료했습니다. 로컬 데모 피드를 확장했습니다.",
+    "완료됐습니다. 초기 지도 뷰가 이제 전세계 칩을 보여줍니다.",
+    "리뷰가 돌아오는 동안 대기합니다 — 결과 도착 즉시 후속 조치하겠습니다.",
+    "앱 떴습니다. 브라우저에서 여기로 들어가시면 됩니다. 띄워볼까요?",
+    "RUNTIME_SMOKE_OK",
+  ];
+  for (const text of cases) {
+    assert.equal(classifyAssistantStop(assistant(text)).kind, "clean", text);
+  }
+  assert.equal(classifyAssistantStop(assistant("", { stopReason: "length" })).kind, "premature");
+  assert.equal(classifyAssistantStop(assistant("x", {
+    content: [{ type: "text", text: "writing" }, { type: "toolCall", name: "write", id: "c1" }],
+  })).why, "stop-with-tool-calls");
+});
+
+test("premature dangling stop types continue once the TUI is idle", async t => {
+  const h = await harness(t);
+  await h.ready();
+  await endTurn(h, assistant("Fixing the leftover broken widerScope reference in MapApp."));
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].content, "continue");
+  assert.deepEqual(h.sent[0].options, { deliverAs: "followUp" });
+  assert.equal(h.snapshot().reason, "auto-continue-sent");
+  assert.equal(h.aborts.length, 0);
+});
+
+test("clean Muse stop does not type continue even with open todos", async t => {
+  const h = await harness(t);
+  await h.ready();
+  await endTurn(h, assistant("완료했습니다. 검증 11/11 통과, PR을 열었습니다."));
+  noAutomaticActions(h);
+  await endTurn(h, assistant("I'll stop when a PR URL exists."));
+  noAutomaticActions(h);
+  await endTurn(h, assistant("RUNTIME_SMOKE_OK"));
+  noAutomaticActions(h);
+});
+
+test("user abort and a live draft cancel a pending premature continue", async t => {
+  const h = await harness(t);
+  await h.ready();
+  await h.emit("agent_end", { aborted: true, abortSource: "user", messages: [assistant("Fixing leftover state.")] });
+  await h.emit("agent_settled");
+  noAutomaticActions(h);
+  await h.command("resume");
+  h.state.draft = "user is typing";
+  await endTurn(h, assistant("바로 코드를 작성합니다."));
+  noAutomaticActions(h);
+  assert.equal(h.snapshot().reason, "draft-not-known-empty");
+});
+
+test("known background work delays the typed continue until the source drops", async t => {
+  const h = await harness(t);
+  await h.ready();
+  h.bus("wake_source_state", { source: "senpi-task", activeCount: 1 });
+  await endTurn(h, assistant("RED 테스트 실행 중. 완료 알림 오면 구현 들어갑니다."));
+  noAutomaticActions(h);
+  h.bus("wake_source_state", { source: "senpi-task", activeCount: 0 });
+  await h.clock.advance(5_000);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].content, "continue");
+});
+
+test("premature stop continue is at most once per assistant id", async t => {
+  const h = await harness(t);
+  await h.ready();
+  const message = assistant("so checking for a usable fallback before going procedural.");
+  await endTurn(h, message);
+  assert.equal(h.sent.length, 1);
+  h.state.idle = true;
+  await endTurn(h, message);
+  assert.equal(h.sent.length, 1);
+  await endTurn(h, assistant("바로 코드를 작성합니다.", { id: "asst-stop-2" }));
+  assert.equal(h.sent.length, 2);
+});
+
+test("omo -p complete verdict does not type continue on dangling prose", async t => {
+  const h = await harness(t, { inspect: () => "complete" });
+  await h.ready();
+  await endTurn(h, assistant("Fixing the leftover broken widerScope reference in MapApp."));
+  noAutomaticActions(h);
+  assert.equal(h.snapshot().reason, "inspect-complete");
+  assert.equal(h.inspections.length, 1);
+  assert.match(h.inspections[0].text, /Fixing the leftover/);
+});
+
+test("omo -p premature verdict types continue even without dangling prose", async t => {
+  const h = await harness(t, { inspect: () => "premature" });
+  await h.ready();
+  await endTurn(h, assistant("The UI is written."));
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].content, "continue");
+  assert.equal(h.snapshot().stopVerdict.why, "omo-p");
+});
+
+test("structural leftover tool calls skip omo -p and still continue", async t => {
+  const h = await harness(t);
+  await h.ready();
+  await endTurn(h, assistant("writing", {
+    content: [{ type: "text", text: "writing" }, { type: "toolCall", name: "write", id: "c1" }],
+  }));
+  assert.equal(h.inspections.length, 0);
+  assert.equal(h.sent[0].content, "continue");
+});
+
+test("inspect command is an ephemeral omo -p child", () => {
+  const { bin, args } = buildInspectCommand("PROMPT", { model: { provider: "cliproxy", id: "muse-spark-1.3-contributor-free" } });
+  assert.equal(bin, "omo");
+  assert.equal(args[0], "-p");
+  for (const flag of ["--no-session", "--no-extensions", "--no-tools", "--omo-senpi-disabled"]) {
+    assert.ok(args.includes(flag), flag);
+  }
+  assert.equal(args.at(-2), "--");
+  assert.equal(args.at(-1), "PROMPT");
+  assert.ok(args.includes("cliproxy/muse-spark-1.3-contributor-free"));
+  assert.match(buildInspectPrompt({ stopReason: "stop", text: "hello", openTodos: 2 }), /PREMATURE or COMPLETE/);
+  assert.equal(parseInspectVerdict("PREMATURE\n"), "premature");
+  assert.equal(parseInspectVerdict("The turn is COMPLETE."), "complete");
+  assert.equal(parseInspectVerdict("PREMATURE\nCOMPLETE"), "complete");
+  assert.equal(parseInspectVerdict("nope"), "unknown");
+  assert.equal(needsPrintInspect({ kind: "premature", why: "dangling-next-step" }), true);
+  assert.equal(needsPrintInspect({ kind: "premature", why: "truncated" }), false);
+});
+
+test("OMO_MUSE_AUTO_CONTINUE=0 keeps premature inspection but does not type continue", async t => {
+  const previous = process.env.OMO_MUSE_AUTO_CONTINUE;
+  process.env.OMO_MUSE_AUTO_CONTINUE = "0";
+  t.after(() => previous === undefined ? delete process.env.OMO_MUSE_AUTO_CONTINUE : (process.env.OMO_MUSE_AUTO_CONTINUE = previous));
+  const h = await harness(t);
+  await h.ready();
+  await endTurn(h, assistant("Fixing the leftover broken widerScope reference."));
+  noAutomaticActions(h);
+  assert.equal(h.snapshot().automaticContinuation, "disabled");
 });
 
 test("malformed latest todo snapshot blocks stale earlier work, even on error tool results", async t => {

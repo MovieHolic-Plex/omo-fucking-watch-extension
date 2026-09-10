@@ -1,12 +1,22 @@
 /**
- * Fail-closed Muse watchdog for installed Senpi extension APIs.
+ * Muse watchdog for installed Senpi extension APIs.
  *
- * There is no extension-facing snapshot of pending completion deliveries.
- * Therefore timers and lifecycle callbacks NEVER abort or send a continuation.
- * They only warn about silent runs. A manual continuation requires explicit
- * acknowledgement, native-queue/draft checks, and a persisted at-most-once claim.
- * OMO_MUSE_WATCH=0 disables the extension; OMO_MUSE_STALL_MS tunes warnings.
+ * Stall timers never abort. They only warn: pending completion delivery is
+ * still not visible to extensions.
+ *
+ * When a supported Muse turn ends with stopReason=stop, a separate `omo -p`
+ * process classifies whether the last assistant actually completed. The child
+ * is ephemeral (--no-session --no-extensions --no-tools) and cannot recurse
+ * into this watchdog. Truncated / empty / leftover-tool-call stops are
+ * structurally premature and skip the print inspect. A PREMATURE verdict
+ * types `continue` into the TUI once idle.
+ *
+ * Manual /muse-watch continue-confirmed remains available. OMO_MUSE_WATCH=0
+ * disables the extension; OMO_MUSE_AUTO_CONTINUE=0 disables only the typed
+ * continue; OMO_MUSE_INSPECT=0 falls back to the local classifier;
+ * OMO_MUSE_STALL_MS tunes warnings.
  */
+import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 
 const STATE_TYPE = "muse-watch.state";
@@ -18,13 +28,197 @@ const SUPPORTED_MODELS = new Set([
 ]);
 const STATUSES = new Set(["pending", "in_progress", "completed", "abandoned", "cancelled"]);
 const OWNERS = Symbol.for("omo.muse-watch.owners.v1");
+export const INSPECTOR = Symbol.for("omo.muse-watch.inspector.v1");
+const STRUCTURAL_PREMATURE = new Set(["truncated", "empty-stop", "stop-with-tool-calls"]);
 const STALE_PREFIX = "This extension ctx is stale after session replacement or reload.";
 const TICK_MS = 5_000;
 const MAX_STALL_WARNINGS = 4;
+const MAX_AUTO_CONTINUES = 6;
+const CONTINUE_TEXT = "continue";
+const HANDOFF = /I'll stop when|\bgoal complete\b|완료했습니다|완료됐습니다|띄워볼까요|진행할까요|할까요\?|승인 전까지|머지하지 않고 대기|리뷰가 돌아오는 동안 대기|waiting for (you|the user|review)/i;
+const DANGLING = [
+  /\bi(?:['’]?ll| will) (?!stop when)/i,
+  /\b(?:let me|let's|going to|about to)\b/i,
+  /^(?:fixing|writing|checking|continuing|implementing)\b/i,
+  /\b(?:so checking|checking for)\b/i,
+  /완료 알림 오면/,
+  /완료되면 결과/,
+  /들어갑니다/,
+  /작성합니다/,
+  /붙입니다/,
+  /띄워드리/,
+  /고친다/,
+  /살펴보/,
+  /찾아보/,
+  /확인 마저/,
+  /실행 중/,
+  /조립되는 대로/,
+  /검증하고 돌아오/,
+  /바로 코드를/,
+  /바로 실행/,
+];
 
 function stallDuration() {
   const value = Number(process.env.OMO_MUSE_STALL_MS);
   return Number.isSafeInteger(value) && value >= 1_000 ? value : 180_000;
+}
+
+function autoContinueEnabled() {
+  return !["0", "false", "off", "no"].includes(process.env.OMO_MUSE_AUTO_CONTINUE?.toLowerCase());
+}
+
+export function inspectEnabled() {
+  return !["0", "false", "off", "no"].includes(process.env.OMO_MUSE_INSPECT?.toLowerCase());
+}
+
+export function inspectTimeoutMs() {
+  const value = Number(process.env.OMO_MUSE_INSPECT_MS);
+  return Number.isSafeInteger(value) && value >= 3_000 ? value : 45_000;
+}
+
+export function needsPrintInspect(verdict) {
+  if (!inspectEnabled() || !autoContinueEnabled()) return false;
+  if (!verdict || verdict.kind === "no-assistant" || verdict.kind === "other") return false;
+  if (verdict.kind === "premature" && STRUCTURAL_PREMATURE.has(verdict.why)) return false;
+  return true;
+}
+
+export function buildInspectPrompt({ stopReason, text, openTodos, model }) {
+  const modelLabel = model?.provider && model?.id ? `${model.provider}/${model.id}` : "unknown";
+  return [
+    "Classify a coding-agent turn that already ended.",
+    `stopReason: ${stopReason ?? "unknown"}`,
+    `model: ${modelLabel}`,
+    `openTodos: ${openTodos ?? "unknown"}`,
+    "lastAssistant:",
+    "---",
+    String(text ?? "").slice(0, 4_000),
+    "---",
+    "COMPLETE = the assistant finished the work, handed off to the user, asked a question, or explicitly stopped.",
+    "PREMATURE = it only announced more work, said it would check/fix/write/run something, waited for a tool notification, or otherwise did not actually finish.",
+    "Reply with exactly one line: PREMATURE or COMPLETE.",
+  ].join("\n");
+}
+
+export function buildInspectCommand(prompt, payload = {}) {
+  const bin = process.env.OMO_MUSE_INSPECT_BIN || process.env.OMO_BIN || "omo";
+  const args = [
+    "-p",
+    "--no-extensions",
+    "--no-session",
+    "--no-skills",
+    "--no-context-files",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-tools",
+    "--omo-senpi-disabled",
+    "--thinking", "off",
+  ];
+  const model = process.env.OMO_MUSE_INSPECT_MODEL
+    || (payload.model?.provider && payload.model?.id ? `${payload.model.provider}/${payload.model.id}` : undefined);
+  if (model) args.push("--model", model);
+  args.push("--", prompt);
+  return { bin, args };
+}
+
+export function parseInspectVerdict(stdout, stderr = "") {
+  const text = `${stdout ?? ""}\n${stderr ?? ""}`;
+  const matches = [...text.matchAll(/\b(PREMATURE|COMPLETE)\b/gi)];
+  if (matches.length === 0) return "unknown";
+  return matches.at(-1)[1].toUpperCase() === "PREMATURE" ? "premature" : "complete";
+}
+
+export function spawnOmoInspect(payload) {
+  const override = globalThis[INSPECTOR];
+  if (typeof override === "function") return Promise.resolve(override(payload));
+  const prompt = buildInspectPrompt(payload);
+  const { bin, args } = buildInspectCommand(prompt, payload);
+  const timeout = inspectTimeoutMs();
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(bin, args, {
+        env: {
+          ...process.env,
+          OMO_MUSE_WATCH: "0",
+          OMO_MUSE_AUTO_CONTINUE: "0",
+          OMO_MUSE_INSPECT: "0",
+          PI_TELEMETRY: "0",
+          DO_NOT_TRACK: "1",
+        },
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", chunk => { stdout += chunk; });
+    child.stderr?.on("data", chunk => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`omo -p inspect timed out after ${timeout}ms`));
+    }, timeout);
+    child.on("error", error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", code => {
+      clearTimeout(timer);
+      const verdict = parseInspectVerdict(stdout, stderr);
+      if (verdict === "unknown") {
+        reject(new Error(`omo -p inspect produced no verdict (exit ${code}): ${stdout.slice(-400)} ${stderr.slice(-400)}`));
+        return;
+      }
+      resolve(verdict);
+    });
+  });
+}
+
+export function lastAssistantFrom(messages) {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const entry = messages[i];
+    const message = entry?.role ? entry : entry?.message;
+    if (message?.role !== "assistant") continue;
+    return typeof entry?.id === "string" && entry.id && !message.id ? { ...message, id: entry.id } : message;
+  }
+}
+
+export function assistantText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter(part => part?.type === "text" && typeof part.text === "string").map(part => part.text).join("\n");
+}
+
+export function hasToolCalls(message) {
+  const content = message?.content;
+  if (!Array.isArray(content)) return false;
+  return content.some(part => part && ["toolCall", "toolUse", "tool_use"].includes(part.type));
+}
+
+export function classifyAssistantStop(assistant, openTodos = null) {
+  if (!assistant) return { kind: "no-assistant", why: "missing" };
+  const reason = assistant.stopReason;
+  if (reason === "length") return { kind: "premature", why: "truncated", openTodos };
+  if (reason !== "stop") return { kind: "other", why: reason ?? "missing-stop-reason", openTodos };
+  if (hasToolCalls(assistant)) return { kind: "premature", why: "stop-with-tool-calls", openTodos };
+  const text = assistantText(assistant).trim();
+  if (!text) return { kind: "premature", why: "empty-stop", openTodos };
+  if (HANDOFF.test(text)) return { kind: "clean", why: "handoff-or-complete", openTodos };
+  if (DANGLING.some(pattern => pattern.test(text))) return { kind: "premature", why: "dangling-next-step", openTodos };
+  return { kind: "clean", why: "stop", openTodos };
+}
+
+function recoveryKey(assistant) {
+  if (typeof assistant?.id === "string" && assistant.id) return `auto:${assistant.id}`;
+  const text = assistantText(assistant).trim().slice(0, 80);
+  return `auto:${assistant?.stopReason ?? "stop"}:${text}`;
 }
 
 function sessionId(ctx) {
@@ -93,12 +287,18 @@ export default function museWatch(pi) {
   let lastActivity = Date.now();
   let warned = false;
   let warningCount = 0;
+  let autoCount = 0;
   let lastReason = "not-started";
+  let lastVerdict = { kind: "none", why: "not-started" };
+  let pendingRecovery;
+  let inspectGeneration = 0;
   const owner = { stop, command: handleCommand };
 
   function stop() {
     clearInterval(timer);
     timer = undefined;
+    inspectGeneration += 1;
+    pendingRecovery = undefined;
     if (id && owners.get(id) === owner) owners.delete(id);
     active = false;
     liveCtx = undefined;
@@ -114,7 +314,17 @@ export default function museWatch(pi) {
         return;
       }
       liveCtx = ctx;
-      fn();
+      const result = fn();
+      if (result && typeof result.then === "function") {
+        return result.catch(error => {
+          if (!active || disposed) return;
+          stop();
+          if (!(error instanceof Error && error.message.startsWith(STALE_PREFIX))) {
+            console.error("muse-watch context failure; recovery disabled", error);
+          }
+        });
+      }
+      return result;
     } catch (error) {
       stop();
       if (!(error instanceof Error && error.message.startsWith(STALE_PREFIX))) {
@@ -143,8 +353,12 @@ export default function museWatch(pi) {
       backgroundActive: [...wakes.values()].some(count => count > 0) || [...holds.values()].some(Boolean),
       wakeSources: Object.fromEntries(wakes),
       completionDelivery: "unknown",
-      automaticContinuation: "blocked-pending-delivery-visibility",
+      automaticContinuation: autoContinueEnabled() ? "premature-stop-continue" : "disabled",
       automaticAbort: false,
+      stopVerdict: lastVerdict,
+      pendingPrematureStop: pendingRecovery?.inspecting ? null : pendingRecovery?.verdict.why ?? null,
+      inspectingStop: pendingRecovery?.inspecting === true,
+      autoContinues: autoCount,
       openTodos: todos === null ? null : todos.length,
       stalled: false,
     };
@@ -156,7 +370,7 @@ export default function museWatch(pi) {
     pi.events.emit("muse_watch_state", data);
     // Real Senpi RPC extension events; useful to read-only diagnostics clients.
     pi.rpc?.emit("muse_watch_state", data);
-    liveCtx.ui?.setStatus?.("muse-watch", `${reason}; open=${data.openTodos ?? "unknown"}; auto=blocked`);
+    liveCtx.ui?.setStatus?.("muse-watch", `${reason}; open=${data.openTodos ?? "unknown"}; auto=${data.automaticContinuation}`);
     return data;
   }
 
@@ -207,6 +421,7 @@ export default function museWatch(pi) {
   }
 
   function tick() {
+    tryAutoContinue();
     const snapshot = observe();
     if (veto(snapshot) || snapshot.idle || Date.now() - lastActivity < stallMs) return;
     publish("stall-observed", { ...snapshot, stalled: true });
@@ -214,6 +429,52 @@ export default function museWatch(pi) {
       warned = true;
       warningCount += 1;
       notify("Muse has no recent stream/tool activity. No automatic abort or resend: pending completion delivery is unknown. Inspect the run; use Escape to stop it yourself.", "warning");
+    }
+  }
+
+  function tryAutoContinue() {
+    if (!pendingRecovery || pendingRecovery.inspecting || !autoContinueEnabled()) return;
+    const snapshot = observe();
+    const blocked = veto(snapshot) ?? (snapshot.idle ? undefined : "agent-busy");
+    if (blocked) {
+      if (["paused", "draft-not-known-empty", "queued-messages", "input-pending", "invalid-session", "invalid-state"].includes(blocked)) {
+        pendingRecovery = undefined;
+        publish(blocked, snapshot);
+      }
+      return;
+    }
+    if (autoCount >= MAX_AUTO_CONTINUES) {
+      pendingRecovery = undefined;
+      publish("auto-continue-capped", snapshot);
+      notify("muse-watch: premature-stop continue cap reached. Type continue yourself if the run is still unfinished.", "warning");
+      return;
+    }
+    const key = pendingRecovery.key;
+    if (state.attempts.includes(key)) {
+      pendingRecovery = undefined;
+      publish("attempt-already-claimed", snapshot);
+      return;
+    }
+    const file = liveCtx.sessionManager.getSessionFile?.();
+    const entries = liveCtx.sessionManager.getEntries();
+    if (typeof file !== "string" || !isAbsolute(file) || !entries.some(entry => entry.type === "message" && entry.message?.role === "assistant")) {
+      pendingRecovery = undefined;
+      publish("non-durable-session", snapshot);
+      return;
+    }
+    if (!persist({ ...state, attempts: [...state.attempts, key] })) return;
+    const why = pendingRecovery.verdict.why;
+    try {
+      pi.sendUserMessage(CONTINUE_TEXT, { deliverAs: "followUp" });
+      autoCount += 1;
+      pendingRecovery = undefined;
+      publish("auto-continue-sent", snapshot);
+      notify(`muse-watch: premature stop (${why}). Typed continue.`);
+    } catch (error) {
+      console.error("muse-watch auto-continue outcome unknown; claim retained", error);
+      pendingRecovery = undefined;
+      publish("send-outcome-unknown");
+      notify("Continuation delivery is unknown. The attempt remains claimed and will not be retried.", "error");
     }
   }
 
@@ -247,6 +508,10 @@ export default function museWatch(pi) {
       retrying = false;
       activity();
       warningCount = 0;
+      autoCount = 0;
+      inspectGeneration += 1;
+      pendingRecovery = undefined;
+      lastVerdict = { kind: "none", why: "session-start" };
       publish(!id ? "invalid-session" : !valid ? "invalid-state" : state.paused ? "paused" : "observing-only");
       if (id && valid) timer = setInterval(() => guarded(liveCtx, tick), TICK_MS);
     } catch (error) {
@@ -277,14 +542,97 @@ export default function museWatch(pi) {
       }
     }
     retrying = false;
+    inspectGeneration += 1;
+    pendingRecovery = undefined;
     activity();
   }));
-  pi.on("agent_settled", (_event, ctx) => guarded(ctx, () => { retrying = false; activity(); publish(); }));
-  pi.on("agent_end", (event, ctx) => guarded(ctx, () => {
-    retrying = event.willRetry === true;
-    if (event.aborted === true && event.abortSource === "user") setPaused(true);
+  pi.on("agent_settled", (_event, ctx) => guarded(ctx, () => {
+    retrying = false;
+    activity();
+    tryAutoContinue();
+    publish();
   }));
-  pi.on("session_abort", (_event, ctx) => guarded(ctx, () => setPaused(true)));
+  pi.on("agent_end", (event, ctx) => guarded(ctx, async () => {
+    retrying = event.willRetry === true;
+    inspectGeneration += 1;
+    const generation = inspectGeneration;
+    if (event.aborted === true && event.abortSource === "user") {
+      pendingRecovery = undefined;
+      lastVerdict = { kind: "other", why: "user-abort" };
+      setPaused(true);
+      return;
+    }
+    if (retrying) {
+      pendingRecovery = undefined;
+      lastVerdict = { kind: "other", why: "retrying" };
+      return;
+    }
+    const assistant = lastAssistantFrom(event.messages) ?? lastAssistantFrom(ctx.sessionManager?.getBranch?.());
+    const todos = openTodos(ctx.sessionManager?.getBranch?.());
+    const regexVerdict = classifyAssistantStop(assistant, todos === null ? null : todos.length);
+    lastVerdict = regexVerdict;
+    if (!assistant || regexVerdict.kind === "other" || regexVerdict.kind === "no-assistant") {
+      pendingRecovery = undefined;
+      return;
+    }
+    const key = recoveryKey(assistant);
+    if (regexVerdict.kind === "premature" && STRUCTURAL_PREMATURE.has(regexVerdict.why)) {
+      pendingRecovery = { key, verdict: regexVerdict };
+      publish("premature-stop");
+      return;
+    }
+    if (!needsPrintInspect(regexVerdict)) {
+      if (regexVerdict.kind === "premature") {
+        pendingRecovery = { key, verdict: regexVerdict };
+        publish("premature-stop");
+      } else {
+        pendingRecovery = undefined;
+      }
+      return;
+    }
+    pendingRecovery = { key, verdict: { kind: "pending-inspect", why: "omo-p" }, inspecting: true };
+    publish("inspecting-stop");
+    notify("muse-watch: stop ended; asking omo -p whether the turn actually completed.");
+    try {
+      const printed = await spawnOmoInspect({
+        stopReason: assistant.stopReason,
+        text: assistantText(assistant),
+        openTodos: regexVerdict.openTodos,
+        model: ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null,
+        regexKind: regexVerdict.kind,
+        regexWhy: regexVerdict.why,
+      });
+      if (disposed || !active || generation !== inspectGeneration) return;
+      if (printed === "premature") {
+        lastVerdict = { kind: "premature", why: "omo-p", openTodos: regexVerdict.openTodos };
+        pendingRecovery = { key, verdict: lastVerdict };
+        publish("premature-stop");
+        tryAutoContinue();
+        return;
+      }
+      lastVerdict = { kind: "clean", why: "omo-p-complete", openTodos: regexVerdict.openTodos };
+      pendingRecovery = undefined;
+      publish("inspect-complete");
+    } catch (error) {
+      if (disposed || !active || generation !== inspectGeneration) return;
+      console.error("muse-watch omo -p inspect failed; falling back to local classifier", error);
+      if (regexVerdict.kind === "premature") {
+        lastVerdict = { ...regexVerdict, why: `${regexVerdict.why}+inspect-failed` };
+        pendingRecovery = { key, verdict: lastVerdict };
+        publish("inspect-failed-fallback");
+        tryAutoContinue();
+        return;
+      }
+      pendingRecovery = undefined;
+      lastVerdict = { ...regexVerdict, why: `${regexVerdict.why}+inspect-failed` };
+      publish("inspect-failed-clean");
+    }
+  }));
+  pi.on("session_abort", (_event, ctx) => guarded(ctx, () => {
+    inspectGeneration += 1;
+    pendingRecovery = undefined;
+    setPaused(true);
+  }));
   pi.on("input", (event, ctx) => guarded(ctx, () => {
     if (["interactive", "rpc"].includes(event.source) && typeof event.inputId === "string") {
       inputs.set(event.inputId, { generation: pauseGeneration, disposition: "pending" });
@@ -371,7 +719,7 @@ export default function museWatch(pi) {
   }
 
   pi.registerCommand("muse-watch", {
-    description: "Status/pause/resume; continue explains manual recovery, continue-confirmed acknowledges unknown completion delivery.",
+    description: "Status/pause/resume; auto-types continue after a premature Muse stop; continue-confirmed is the manual override.",
     handler: (args, ctx) => {
       if (disposed) return;
       try {

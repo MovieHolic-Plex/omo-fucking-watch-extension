@@ -54,6 +54,7 @@ const env = {
   PI_TELEMETRY: "0",
   DO_NOT_TRACK: "1",
   OMO_MUSE_WATCH: "1",
+  OMO_MUSE_INSPECT: "0",
   OMO_ENABLE_SHARED_HOST: "0",
   OMO_RPC_CLIENT_CAPABILITIES: "extension_events",
   NO_COLOR: "1",
@@ -480,7 +481,7 @@ try {
   assert.equal(initial.supportedModel, true);
   assert.equal(initial.draftKnownEmpty, false);
   assert.equal(initial.completionDelivery, "unknown");
-  assert.equal(initial.automaticContinuation, "blocked-pending-delivery-visibility");
+  assert.equal(initial.automaticContinuation, "premature-stop-continue");
   assert.equal(initial.automaticAbort, false);
   await rpc.command("resume");
   for (const [providerName, id, supported] of [
@@ -572,7 +573,7 @@ try {
     await legacy.command("resume");
     const state = await legacy.status();
     assert.equal(state.openTodos, 0, name);
-    assert.equal(state.automaticContinuation, "blocked-pending-delivery-visibility");
+    assert.equal(state.automaticContinuation, "premature-stop-continue");
     assert.equal((await legacy.command("continue-confirmed")).reason, "draft-not-known-empty");
     await legacy.assertQuiet(2);
     await legacy.stop();

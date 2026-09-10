@@ -1,7 +1,7 @@
 {
   "name": "omo-fucking-watch-extension",
-  "version": "0.2.0",
-  "description": "Senpi/OmO extension: Muse stall warnings and guarded, explicit manual continuation.",
+  "version": "0.3.1",
+  "description": "Senpi/OmO extension: Muse stall warnings, omo -p stop inspection, and a typed continue when the stop is not a real turn end.",
   "type": "module",
   "license": "MIT",
   "homepage": "https://github.com/MovieHolic-Plex/omo-fucking-watch-extension",

@@ -1,10 +1,18 @@
 # omo-fucking-watch-extension
 
-Muse Spark 세션의 정지 징후를 알리고, 사용자가 명시적으로 요청한 재개를 보호하는 OmO/Senpi 확장이다.
+Muse Spark 세션의 정지 징후를 알리고, **stop이 진짜 턴 종료인지** 검사하는 OmO/Senpi 확장이다.
 
-**자동 abort와 자동 continue는 하지 않는다.** 현재 엔진은 백그라운드 작업의 완료 알림이
-아직 전달 대기 중인지 확장에 알려주지 않는다. idle이나 열린 todo만 보고 작업을
-재개하던 구버전 동작을 제거했다. 모델 API의 HTTP 오류와 retry는 엔진이 처리한다.
+자동 abort는 하지 않는다. 엔진은 백그라운드 완료 알림이 아직 전달 대기 중인지
+확장에 알려주지 않으므로, 침묵 hang에 대해 Escape를 대신 누르지 않는다.
+
+Muse contributor 턴이 `agent_end`로 끝나면 마지막 assistant를 본다.
+
+잘린 응답, 빈 stop, 같은 메시지에 tool call이 남은 stop은 구조적으로 이상한
+종료다. 그 외 `stopReason=stop` 텍스트는 **별도 `omo -p` 프로세스**에 마지막
+assistant 본문을 넣고 PREMATURE/COMPLETE를 묻는다. 자식은 `--no-session
+--no-extensions --no-tools`라 원본 세션을 건드리지 않고 이 확장도 다시 안 탄다.
+PREMATURE이고 TUI 입력칸이 비어 있으며 idle이면 **`continue`를 사용자 메시지로
+전송**한다. `omo -p`가 실패하면 로컬 분류기로 폴백한다.
 
 ## 설치
 
@@ -103,10 +111,17 @@ pause가 해제된 지원 모델에서 도구·retry·입력·예약 메시지·
 | 환경변수 | 기본 | 의미 |
 | --- | --- | --- |
 | `OMO_MUSE_WATCH` | on | `0`, `false`, `off`, `no`이면 확장 비활성 |
+| `OMO_MUSE_AUTO_CONTINUE` | on | `0`, `false`, `off`, `no`이면 조기 stop에 `continue`를 넣지 않음 |
+| `OMO_MUSE_INSPECT` | on | `0`, `false`, `off`, `no`이면 `omo -p`를 건너뛰고 로컬 분류기만 사용 |
+| `OMO_MUSE_INSPECT_MS` | `45000` | `omo -p` 제한 시간. 최소 3000ms |
+| `OMO_MUSE_INSPECT_BIN` | `omo` | 점검용 실행 파일. `OMO_BIN`도 동일 |
+| `OMO_MUSE_INSPECT_MODEL` | 현재 세션 모델 | `omo -p --model` 강제 |
 | `OMO_MUSE_STALL_MS` | `180000` | 무활동 경고 기준. 최소 1000ms |
 | `OMO_IDLE_TODO_KICK` | on | 외부 읽기 전용 진단. 비활성 값이면 snapshot도 조회하지 않음 |
 
-기존 idle 유예·외부 polling·cooldown·kick 횟수 환경변수는 자동 재개 제거로 사용하지 않는다.
+조기 stop 재개는 세션당 최대 6회, assistant 메시지당 1회다. 사용자 abort, 작성 중인
+입력칸, 큐, 알려진 백그라운드 작업, RPC/print처럼 입력칸을 모르는 모드는 보내지 않는다.
+Stall 경고는 계속 abort하지 않는다.
 
 ## 외부 자동 감시기에서 이관
 
@@ -135,7 +150,8 @@ agent status만 JSON으로 보여준다. 모델·입력·완료 여부를 추론
 ## 검증
 
 `npm run check`는 JavaScript 구문 검사와 Node/Python 회귀 테스트를 실행한다.
-가상 시간 테스트는 자동 전송 금지, 중단·입력·대기 보호, 재개 시도 기록을 검사한다.
+가상 시간 테스트는 조기 stop에만 `continue`를 보내는지, 정상 종료·중단·입력·대기
+보호, 재개 시도 기록을 검사한다.
 Python CLI 테스트는 가짜 Herdr 실행 파일을 통해 snapshot 외 호출이 없는지 확인한다.
 모델 API는 호출하지 않는다.
 
