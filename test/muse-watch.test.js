@@ -38,7 +38,7 @@ function virtualClock(t) {
 
 async function harness(t, options = {}) {
   const clock = virtualClock(t);
-  for (const [key, value] of Object.entries({ OMO_MUSE_WATCH: "1", OMO_MUSE_STALL_MS: "40000" })) {
+  for (const [key, value] of Object.entries({ OMO_MUSE_WATCH: "1", OMO_MUSE_STALL_MS: "40000", OMO_MUSE_AUTOKICK: "0", ...options.env })) {
     const previous = process.env[key];
     process.env[key] = value;
     t.after(() => previous === undefined ? delete process.env[key] : (process.env[key] = previous));
@@ -333,7 +333,7 @@ test("pause state is session-wide, not lost by navigating to an older branch", a
   await h.command("continue-confirmed"); reason(h, "paused");
 });
 
-test("replacement invalidates callbacks and foreign session records never unpause a new identity", async t => {
+test("replacement invalidates callbacks; a genuinely new identity starts observing (unpaused default)", async t => {
   const h = await harness(t); await h.ready();
   await h.emit("session_before_switch");
   assert.equal(h.clock.timers.size, 1);
@@ -341,8 +341,9 @@ test("replacement invalidates callbacks and foreign session records never unpaus
   await h.emit("message_update");
   assert.equal(h.clock.timers.size, 0);
   await h.start();
-  await h.command("continue-confirmed"); reason(h, "paused");
-  noAutomaticActions(h);
+  h.todos();
+  await h.command("continue-confirmed");
+  assert.equal(h.sent.length, 1);
 });
 
 for (const sid of [undefined, "", "unknown-session", 7]) {
@@ -397,7 +398,7 @@ test("explicit manual continuation needs acknowledgement, and claims before a vo
   reason(h, "manual-attempt-claimed");
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].message.customType, "muse-watch.continue");
-  assert.deepEqual(h.sent[0].message.details, { sessionId: SID, admissionKey: "user-1" });
+  assert.deepEqual(h.sent[0].message.details, { sessionId: SID, admissionKey: "user-1", source: "manual" });
   assert.deepEqual(h.sent[0].options, { triggerTurn: true, deliverAs: "followUp" });
   await h.command("continue-confirmed"); reason(h, "attempt-already-claimed");
   await h.command("resume"); await h.reload();
@@ -682,4 +683,97 @@ test("malformed latest todo snapshot blocks stale earlier work, even on error to
   h.todos();
   h.entries.push({ type: "message", message: { role: "toolResult", toolName: "todo", isError: true, details: { phases: [] } } });
   await h.command("continue-confirmed"); reason(h, "invalid-todos"); noAutomaticActions(h);
+});
+
+// --- OMO_MUSE_AUTOKICK: opt-in automatic recovery after a confirmed stall. ---
+
+test("autokick disabled by default (OMO_MUSE_WATCH alone never triggers abort or send)", async t => {
+  const h = await harness(t); await h.ready(); h.todos(); h.state.idle = false;
+  await h.emit("agent_start");
+  await h.clock.advance(600_000);
+  noAutomaticActions(h);
+  assert.equal(h.aborts.length, 0);
+});
+
+test("autokick aborts a live stall, then sends exactly one continuation once settled", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1" } });
+  await h.ready(); h.todos(); h.state.idle = false;
+  await h.emit("agent_start");
+  await h.clock.advance(40_000);
+  assert.equal(h.aborts.length, 1);
+  assert.equal(h.aborts[0], "muse-watch-autokick");
+  assert.equal(h.sent.length, 0);
+  await h.emit("agent_end", { aborted: true, abortSource: "muse-watch-autokick" });
+  h.state.idle = true;
+  await h.emit("agent_settled");
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].message.customType, "muse-watch.continue");
+  assert.equal(h.sent[0].message.details.source, "auto-kick");
+  assert.equal(h.snapshot().attempts, 1);
+});
+
+test("autokick never fires twice for the same stall; only after fresh activity and a new stall", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1" } });
+  await h.ready(); h.todos(); h.state.idle = false;
+  await h.emit("agent_start");
+  await h.clock.advance(90_000);
+  assert.equal(h.aborts.length, 1);
+  await h.emit("agent_end", { aborted: true, abortSource: "muse-watch-autokick" });
+  h.state.idle = true;
+  await h.emit("agent_settled");
+  assert.equal(h.sent.length, 1);
+});
+
+test("autokick respects a session-scoped attempt cap (default 3) even across repeated stalls", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1", OMO_MUSE_AUTOKICK_MAX: "2" } });
+  await h.ready();
+  for (let round = 0; round < 3; round += 1) {
+    h.entries.push({ type: "message", id: `user-${round + 2}`, message: { role: "user", content: "go" } });
+    h.todos(); h.state.idle = false;
+    await h.emit("agent_start");
+    await h.clock.advance(40_000);
+    if (round < 2) {
+      assert.equal(h.aborts.length, round + 1);
+      await h.emit("agent_end", { aborted: true, abortSource: "muse-watch-autokick" });
+      h.state.idle = true;
+      await h.emit("agent_settled");
+    } else {
+      // Cap reached: no further abort, no further send.
+      assert.equal(h.aborts.length, 2);
+      h.state.idle = true;
+      await h.emit("agent_settled");
+    }
+  }
+  assert.equal(h.sent.length, 2);
+});
+
+test("autokick honors every existing veto: paused session never aborts", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1" } });
+  await h.ready(); await h.command("pause"); h.todos(); h.state.idle = false;
+  await h.emit("agent_start");
+  await h.clock.advance(600_000);
+  assert.equal(h.aborts.length, 0);
+  noAutomaticActions(h);
+});
+
+test("a user abort during an autokick-triggered abort still records user pause, not auto-continue", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1" } });
+  await h.ready(); h.todos(); h.state.idle = false;
+  await h.emit("agent_start");
+  await h.clock.advance(40_000);
+  assert.equal(h.aborts.length, 1);
+  await h.emit("agent_end", { aborted: true, abortSource: "user" });
+  h.state.idle = true;
+  await h.emit("agent_settled");
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.snapshot().paused, true);
+});
+
+test("autokick without a live ctx.abort function never fires", async t => {
+  const h = await harness(t, { env: { OMO_MUSE_AUTOKICK: "1" } });
+  await h.ready(); h.todos(); h.state.idle = false;
+  delete h.ctx.abort;
+  await h.emit("agent_start");
+  await h.clock.advance(600_000);
+  noAutomaticActions(h);
 });

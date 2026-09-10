@@ -104,9 +104,23 @@ pause가 해제된 지원 모델에서 도구·retry·입력·예약 메시지·
 | --- | --- | --- |
 | `OMO_MUSE_WATCH` | on | `0`, `false`, `off`, `no`이면 확장 비활성 |
 | `OMO_MUSE_STALL_MS` | `180000` | 무활동 경고 기준. 최소 1000ms |
+| `OMO_MUSE_AUTOKICK` | on | `0`, `false`, `off`, `no`이면 자동 재개 비활성 (경고는 그대로 동작) |
+| `OMO_MUSE_AUTOKICK_MAX` | `3` | 세션당 자동 재개 최대 횟수. 최소 1 |
 | `OMO_IDLE_TODO_KICK` | on | 외부 읽기 전용 진단. 비활성 값이면 snapshot도 조회하지 않음 |
 
 기존 idle 유예·외부 polling·cooldown·kick 횟수 환경변수는 자동 재개 제거로 사용하지 않는다.
+
+## 자동 재개 (opt-out, 기본 켜짐)
+
+네 번째 경고(3분 무활동)에도 pause 해제·지원 모델·draft 비어있음·큐 비어있음·
+compacting 아님·백그라운드 작업 없음 등 수동 재개와 동일한 차단 조건이 전부
+통과하면, 멈춘 턴을 `ctx.abort("muse-watch-autokick")`로 중단시키고 그 턴이
+완전히 정착(`agent_settled`)한 뒤 수동 `continue-confirmed`와 같은 at-most-once
+claim 경로로 continuation을 한 번 전송한다. 세션당 `OMO_MUSE_AUTOKICK_MAX`
+(기본 3)회까지만 시도하며, 사용자가 abort하면(`abortSource !== "muse-watch-autokick"`)
+autokick은 즉시 취소되고 pause로 기록된다. `ctx.abort`가 없는 실행 환경에서는
+전혀 동작하지 않는다. `OMO_MUSE_AUTOKICK=0`으로 언제든 끌 수 있으며, 그 경우
+기존 경고-전용 동작으로 완전히 되돌아간다.
 
 ## 외부 자동 감시기에서 이관
 

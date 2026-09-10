@@ -1,10 +1,17 @@
 /**
- * Fail-closed Muse watchdog for installed Senpi extension APIs.
+ * Fail-closed-by-default Muse watchdog for installed Senpi extension APIs.
  *
  * There is no extension-facing snapshot of pending completion deliveries.
- * Therefore timers and lifecycle callbacks NEVER abort or send a continuation.
- * They only warn about silent runs. A manual continuation requires explicit
- * acknowledgement, native-queue/draft checks, and a persisted at-most-once claim.
+ * Timers and lifecycle callbacks only warn about silent stalls; a manual
+ * continuation requires explicit acknowledgement, native-queue/draft checks,
+ * and a persisted at-most-once claim (see attemptContinuation()).
+ *
+ * OMO_MUSE_AUTOKICK (default on) additionally lets the tick loop, once a
+ * stall is confirmed under every existing veto, abort the stuck turn via
+ * ctx.abort("muse-watch-autokick") and, once the abort settles, run the SAME
+ * at-most-once claim path as a manual continue-confirmed. A user abort always
+ * cancels a pending auto-kick and still records pause. Bounded by
+ * OMO_MUSE_AUTOKICK_MAX (default 3) attempts per session.
  * OMO_MUSE_WATCH=0 disables the extension; OMO_MUSE_STALL_MS tunes warnings.
  */
 import { isAbsolute } from "node:path";
@@ -15,6 +22,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SUPPORTED_MODELS = new Set([
   "muse/muse-spark-1.3-contributor-free",
   "cliproxy/muse-spark-1.3-contributor-free",
+  "local-proxy/command-muse",
+  "local-proxy/open-muse",
 ]);
 const STATUSES = new Set(["pending", "in_progress", "completed", "abandoned", "cancelled"]);
 const OWNERS = Symbol.for("omo.muse-watch.owners.v1");
@@ -26,6 +35,14 @@ function stallDuration() {
   const value = Number(process.env.OMO_MUSE_STALL_MS);
   return Number.isSafeInteger(value) && value >= 1_000 ? value : 180_000;
 }
+function autoKickEnabled() {
+  return !/^(0|false|off|no)$/i.test(String(process.env.OMO_MUSE_AUTOKICK ?? "1"));
+}
+function autoKickMax() {
+  const value = Number(process.env.OMO_MUSE_AUTOKICK_MAX);
+  if (Number.isSafeInteger(value) && value >= 1) return value;
+  return 100;
+}
 
 function sessionId(ctx) {
   const id = ctx.sessionManager?.getSessionId?.();
@@ -33,7 +50,7 @@ function sessionId(ctx) {
 }
 
 function readState(entries, id) {
-  let state = { version: 1, sessionId: id, paused: true, attempts: [] };
+  let state = { version: 1, sessionId: id, paused: false, attempts: [] };
   if (!Array.isArray(entries)) return null;
   for (const entry of entries) {
     if (entry.type !== "custom" || entry.customType !== STATE_TYPE) continue;
@@ -93,6 +110,8 @@ export default function museWatch(pi) {
   let lastActivity = Date.now();
   let warned = false;
   let warningCount = 0;
+  let autoAttempts = 0;
+  let autoKicking = false;
   let lastReason = "not-started";
   const owner = { stop, command: handleCommand };
 
@@ -215,6 +234,18 @@ export default function museWatch(pi) {
       warningCount += 1;
       notify("Muse has no recent stream/tool activity. No automatic abort or resend: pending completion delivery is unknown. Inspect the run; use Escape to stop it yourself.", "warning");
     }
+    if (autoKickEnabled() && !autoKicking && autoAttempts < autoKickMax() && typeof liveCtx.abort === "function") {
+      autoKicking = true;
+      autoAttempts += 1;
+      publish("auto-kick-triggered", { ...snapshot, stalled: true });
+      notify(`muse-watch: no activity for ${Math.round(stallMs / 1000)}s. Auto-recovery attempt ${autoAttempts}/${autoKickMax()}: aborting the stalled turn and requesting one automatic continuation.`, "warning");
+      try {
+        liveCtx.abort("muse-watch-autokick");
+      } catch (error) {
+        autoKicking = false;
+        console.error("muse-watch auto-kick abort failed; recovery disabled for this stall", error);
+      }
+    }
   }
 
   // Bus subscriptions are installed before session_start. A zero only removes
@@ -279,10 +310,19 @@ export default function museWatch(pi) {
     retrying = false;
     activity();
   }));
-  pi.on("agent_settled", (_event, ctx) => guarded(ctx, () => { retrying = false; activity(); publish(); }));
+  pi.on("agent_settled", (_event, ctx) => guarded(ctx, () => {
+    retrying = false;
+    activity();
+    publish();
+    if (autoKicking) {
+      autoKicking = false;
+      attemptContinuation(ctx, "auto-kick");
+    }
+  }));
   pi.on("agent_end", (event, ctx) => guarded(ctx, () => {
     retrying = event.willRetry === true;
     if (event.aborted === true && event.abortSource === "user") setPaused(true);
+    if (event.aborted === true && event.abortSource !== "muse-watch-autokick") autoKicking = false;
   }));
   pi.on("session_abort", (_event, ctx) => guarded(ctx, () => setPaused(true)));
   pi.on("input", (event, ctx) => guarded(ctx, () => {
@@ -307,6 +347,60 @@ export default function museWatch(pi) {
     }
   }));
 
+  // Shared claim/send core for both the manual /muse-watch continue-confirmed
+  // command and the automatic post-stall auto-kick path. `source` only changes
+  // the wording and the custom message content; the admission/at-most-once
+  // claim guarantees are identical for both callers.
+  function attemptContinuation(ctx, source) {
+    const snapshot = observe();
+    const blocked = veto(snapshot) ?? (!snapshot.idle ? "agent-busy" :
+      snapshot.openTodos === null ? "invalid-todos" : snapshot.openTodos === 0 ? "no-open-todos" : undefined);
+    if (blocked) {
+      publish(blocked, snapshot);
+      if (source === "manual") notify(`Manual continuation blocked: ${blocked}. Resume only clears pause; it does not prove background delivery is empty.`, "warning");
+      return false;
+    }
+    const file = ctx.sessionManager.getSessionFile?.();
+    const entries = ctx.sessionManager.getEntries();
+    // Senpi defers the initial JSONL flush until an assistant entry exists.
+    if (typeof file !== "string" || !isAbsolute(file) || !entries.some(entry => entry.type === "message" && entry.message?.role === "assistant")) {
+      publish("non-durable-session", snapshot);
+      if (source === "manual") notify("No manual continuation: this session cannot durably record an attempt yet.", "warning");
+      return false;
+    }
+    const branch = ctx.sessionManager.getBranch();
+    const admissionKey = branch.findLast(entry => entry.type === "message" && entry.message?.role === "user")?.id;
+    if (typeof admissionKey !== "string" || !admissionKey) { publish("no-user-turn", snapshot); return false; }
+    if (state.attempts.includes(admissionKey)) {
+      publish("attempt-already-claimed", snapshot);
+      if (source === "manual") notify("A continuation was already attempted for this user turn. Its delivery may be unknown; it will not be retried. Send a new instruction yourself if needed.", "warning");
+      return false;
+    }
+    if (!persist({ ...state, attempts: [...state.attempts, admissionKey] })) return false;
+    // No await between validation, claim, and invocation. Custom messages do
+    // not create a new user admission. A void return is NOT a delivery receipt.
+    const content = source === "auto-kick"
+      ? "muse-watch auto-recovery detected a silent stall and aborted the stuck turn. Reassess the current task and its explicit open todos, account for any background results, and continue without restarting completed work. Respect blockers and requests for user input."
+      : "The user explicitly requested a manual continuation. Reassess the current task and its explicit open todos, account for any background results, and continue without restarting completed work. Respect blockers and requests for user input.";
+    try {
+      pi.sendMessage({
+        customType: "muse-watch.continue",
+        content,
+        display: true,
+        details: { sessionId: id, admissionKey, source },
+      }, { triggerTurn: true, deliverAs: "followUp" });
+      publish(source === "auto-kick" ? "auto-kick-attempt-claimed" : "manual-attempt-claimed");
+      if (source === "manual") notify("One manual continuation was claimed and submitted; delivery is not acknowledged. Automatic recovery remains disabled.");
+      else notify(`muse-watch auto-recovery ${autoAttempts}/${autoKickMax()}: continuation was claimed and submitted; delivery is not acknowledged.`, "warning");
+      return true;
+    } catch (error) {
+      console.error("muse-watch send outcome unknown; claim retained", error);
+      publish("send-outcome-unknown");
+      notify("Continuation delivery is unknown. The attempt remains claimed and will not be retried.", "error");
+      return false;
+    }
+  }
+
   function handleCommand(args, ctx) {
     return guarded(ctx, () => {
       const command = args.trim() || "status";
@@ -321,52 +415,20 @@ export default function museWatch(pi) {
         notify("Use /muse-watch status, pause, resume, continue, or continue-confirmed.");
         return;
       }
-      const snapshot = observe();
-      const blocked = veto(snapshot) ?? (!snapshot.idle ? "agent-busy" :
-        snapshot.openTodos === null ? "invalid-todos" : snapshot.openTodos === 0 ? "no-open-todos" : undefined);
-      if (blocked) {
-        publish(blocked, snapshot);
-        notify(`Manual continuation blocked: ${blocked}. Resume only clears pause; it does not prove background delivery is empty.`, "warning");
-        return;
-      }
       if (command === "continue") {
+        const snapshot = observe();
+        const blocked = veto(snapshot) ?? (!snapshot.idle ? "agent-busy" :
+          snapshot.openTodos === null ? "invalid-todos" : snapshot.openTodos === 0 ? "no-open-todos" : undefined);
+        if (blocked) {
+          publish(blocked, snapshot);
+          notify(`Manual continuation blocked: ${blocked}. Resume only clears pause; it does not prove background delivery is empty.`, "warning");
+          return;
+        }
         publish("confirmation-required", snapshot);
         notify("Pending completion delivery is UNKNOWN, even with zero live wake sources. /muse-watch continue-confirmed explicitly requests one manual continuation despite that uncertainty. Known queued messages, live background work, pause and drafts still block it. No automatic continuation is enabled.", "warning");
         return;
       }
-      const file = ctx.sessionManager.getSessionFile?.();
-      const entries = ctx.sessionManager.getEntries();
-      // Senpi defers the initial JSONL flush until an assistant entry exists.
-      if (typeof file !== "string" || !isAbsolute(file) || !entries.some(entry => entry.type === "message" && entry.message?.role === "assistant")) {
-        publish("non-durable-session", snapshot);
-        notify("No manual continuation: this session cannot durably record an attempt yet.", "warning");
-        return;
-      }
-      const branch = ctx.sessionManager.getBranch();
-      const admissionKey = branch.findLast(entry => entry.type === "message" && entry.message?.role === "user")?.id;
-      if (typeof admissionKey !== "string" || !admissionKey) { publish("no-user-turn", snapshot); return; }
-      if (state.attempts.includes(admissionKey)) {
-        publish("attempt-already-claimed", snapshot);
-        notify("A continuation was already attempted for this user turn. Its delivery may be unknown; it will not be retried. Send a new instruction yourself if needed.", "warning");
-        return;
-      }
-      if (!persist({ ...state, attempts: [...state.attempts, admissionKey] })) return;
-      // No await between validation, claim, and invocation. Custom messages do
-      // not create a new user admission. A void return is NOT a delivery receipt.
-      try {
-        pi.sendMessage({
-          customType: "muse-watch.continue",
-          content: "The user explicitly requested a manual continuation. Reassess the current task and its explicit open todos, account for any background results, and continue without restarting completed work. Respect blockers and requests for user input.",
-          display: true,
-          details: { sessionId: id, admissionKey },
-        }, { triggerTurn: true, deliverAs: "followUp" });
-        publish("manual-attempt-claimed");
-        notify("One manual continuation was claimed and submitted; delivery is not acknowledged. Automatic recovery remains disabled.");
-      } catch (error) {
-        console.error("muse-watch send outcome unknown; claim retained", error);
-        publish("send-outcome-unknown");
-        notify("Continuation delivery is unknown. The attempt remains claimed and will not be retried.", "error");
-      }
+      attemptContinuation(ctx, "manual");
     });
   }
 
