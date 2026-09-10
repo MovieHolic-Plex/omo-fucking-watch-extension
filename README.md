@@ -2,8 +2,8 @@
 
 Muse Spark 세션의 정지 징후를 알리고, **stop이 진짜 턴 종료인지** 검사하는 OmO/Senpi 확장이다.
 
-자동 abort는 하지 않는다. 엔진은 백그라운드 완료 알림이 아직 전달 대기 중인지
-확장에 알려주지 않으므로, 침묵 hang에 대해 Escape를 대신 누르지 않는다.
+침묵 hang은 기본적으로 경고만 한다. `OMO_MUSE_AUTOKICK`이 켜져 있고 차단 조건이
+전부 비어 있으면, 확정된 stall에 한해 턴을 abort한 뒤 이어서 한 번 재개한다.
 
 Muse contributor 턴이 `agent_end`로 끝나면 마지막 assistant를 본다.
 
@@ -44,10 +44,10 @@ copy muse-watch.js %USERPROFILE%\.omo\agent\extensions\
 | `/muse-watch continue` | 완료 알림 대기 상태를 확인할 수 없음을 안내. 전송하지 않음 |
 | `/muse-watch continue-confirmed` | 그 불확실성을 사용자가 명시적으로 수락하고 수동 재개 한 번 요청 |
 
-새 세션은 paused로 시작한다. 사용자 abort는 pause로 기록되며 reload, 모델의 자동
-실행, 확장이 만든 입력으로 해제되지 않는다. 새 사용자 입력이 실제로 수락되거나
-명시적으로 `resume`을 실행해야 해제된다. `resume`은 미처리 입력이나 기존 재개
-시도 기록을 지우지 않는다.
+새 세션은 unpaused(`observing-only`)로 시작한다. 사용자 abort는 pause로 기록되며
+reload, 모델의 자동 실행, 확장이 만든 입력으로 해제되지 않는다. 새 사용자 입력이
+실제로 수락되거나 명시적으로 `resume`을 실행해야 해제된다. `resume`은 미처리
+입력이나 기존 재개 시도 기록을 지우지 않는다.
 
 ### 수동 재개의 조건
 
@@ -105,8 +105,8 @@ snapshot에서만 읽는다. `pending`과 `in_progress`가 열린 작업이며,
 
 pause가 해제된 지원 모델에서 도구·retry·입력·예약 메시지·알려진 백그라운드 작업 등
 차단 요인이 없고, 비-idle 상태에서 스트림·도구 활동이 3분간 없으면 경고한다.
-한 세션 시작 주기에서 최대 4회 알리며, 경고는 abort나 재개를 실행하지 않는다.
-실제 중단은 사용자가 Escape로 수행한다.
+한 세션 시작 주기에서 최대 4회 알린다. `OMO_MUSE_AUTOKICK=0`이면 경고만 하고
+abort하지 않는다. 켜져 있으면 아래 자동 재개 절을 따른다.
 
 | 환경변수 | 기본 | 의미 |
 | --- | --- | --- |
@@ -117,11 +117,24 @@ pause가 해제된 지원 모델에서 도구·retry·입력·예약 메시지·
 | `OMO_MUSE_INSPECT_BIN` | `omo` | 점검용 실행 파일. `OMO_BIN`도 동일 |
 | `OMO_MUSE_INSPECT_MODEL` | 현재 세션 모델 | `omo -p --model` 강제 |
 | `OMO_MUSE_STALL_MS` | `180000` | 무활동 경고 기준. 최소 1000ms |
+| `OMO_MUSE_AUTOKICK` | on | `0`, `false`, `off`, `no`이면 자동 재개 비활성 (경고는 그대로 동작) |
+| `OMO_MUSE_AUTOKICK_MAX` | `3` | 세션당 자동 재개 최대 횟수. 최소 1 |
 | `OMO_IDLE_TODO_KICK` | on | 외부 읽기 전용 진단. 비활성 값이면 snapshot도 조회하지 않음 |
 
 조기 stop 재개는 세션당 최대 6회, assistant 메시지당 1회다. 사용자 abort, 작성 중인
 입력칸, 큐, 알려진 백그라운드 작업, RPC/print처럼 입력칸을 모르는 모드는 보내지 않는다.
-Stall 경고는 계속 abort하지 않는다.
+
+## 자동 재개 (opt-out, 기본 켜짐)
+
+네 번째 경고(3분 무활동)에도 pause 해제·지원 모델·draft 비어있음·큐 비어있음·
+compacting 아님·백그라운드 작업 없음 등 수동 재개와 동일한 차단 조건이 전부
+통과하면, 멈춘 턴을 `ctx.abort("muse-watch-autokick")`로 중단시키고 그 턴이
+완전히 정착(`agent_settled`)한 뒤 수동 `continue-confirmed`와 같은 at-most-once
+claim 경로로 continuation을 한 번 전송한다. 세션당 `OMO_MUSE_AUTOKICK_MAX`
+(기본 3)회까지만 시도하며, 사용자가 abort하면(`abortSource !== "muse-watch-autokick"`)
+autokick은 즉시 취소되고 pause로 기록된다. `ctx.abort`가 없는 실행 환경에서는
+전혀 동작하지 않는다. `OMO_MUSE_AUTOKICK=0`으로 언제든 끌 수 있으며, 그 경우
+기존 경고-전용 동작으로 완전히 되돌아간다.
 
 ## 외부 자동 감시기에서 이관
 
